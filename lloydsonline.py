@@ -1,14 +1,24 @@
 """
-lloydsonline.py — scrape auctions and lots from lloydsonline.com.au
+lloydsonline.py — scrape auctions and lots from lloydsonline.com.au.
+Optionally writes results to a database via ADBC.
 
 Usage:
-    python lloydsonline.py auctions                        # list all auctions
-    python lloydsonline.py auctions --json                 # as JSON
-    python lloydsonline.py auctions --out auctions.json    # save to file
+    python lloydsonline.py auctions                        # list all auctions (table)
+    python lloydsonline.py auctions --json                 # as JSON to stdout
+    python lloydsonline.py auctions --out auctions.json    # save JSON to file
+    python lloydsonline.py auctions --write-db             # write via ADBC
 
     python lloydsonline.py lots --aid 67956                # lots for one auction
-    python lloydsonline.py lots --aid 67956 --json         # as JSON
-    python lloydsonline.py lots --aid 67956 --out lots.json
+    python lloydsonline.py lots --aid 67956 --write-db     # write via ADBC
+
+ADBC connection env vars:
+
+    ADBC_DRIVER     Path to ADBC driver .so/.dylib (default: adbc_driver_flightsql)
+    ADBC_URI        Connection URI  (default: grpc://localhost:50051)
+    ADBC_OPTIONS    JSON object of ADBC init options, e.g.
+                    '{"adbc.flight.sql.authorization_header": "Bearer mytoken"}'
+    ADBC_CATALOG    Catalog name for writes (optional)
+    ADBC_SCHEMA     Schema name for writes  (default: public)
 """
 
 import argparse
@@ -30,6 +40,10 @@ HEADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
 def _get(path: str, **params) -> BeautifulSoup:
     url = f"{BASE_URL}/{path}"
     resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
@@ -38,7 +52,7 @@ def _get(path: str, **params) -> BeautifulSoup:
 
 
 # ---------------------------------------------------------------------------
-# Auction list
+# Auction list scraper
 # ---------------------------------------------------------------------------
 
 def scrape_auction_list() -> list[dict]:
@@ -86,16 +100,16 @@ def scrape_auction_list() -> list[dict]:
         auction_type = type_img.get("title") if type_img else None
 
         auctions.append({
-            "auction_id": aid,
-            "title": title,
-            "date": date_str,
-            "state": state,
-            "auctioneer": auctioneer,
+            "auction_id":   aid,
+            "title":        title,
+            "date":         date_str,
+            "state":        state,
+            "auctioneer":   auctioneer,
             "auction_type": auction_type,
-            "is_live": is_live,
-            "image_url": image_url,
-            "details_url": f"{BASE_URL}/{href}",
-            "lots_url": f"{BASE_URL}/AuctionLots.aspx?smode=0&aid={aid}",
+            "is_live":      is_live,
+            "image_url":    image_url,
+            "details_url":  f"{BASE_URL}/{href}",
+            "lots_url":     f"{BASE_URL}/AuctionLots.aspx?smode=0&aid={aid}",
         })
 
     return auctions
@@ -119,7 +133,7 @@ def print_auction_table(auctions: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auction lots
+# Auction lots scraper
 # ---------------------------------------------------------------------------
 
 def scrape_auction_lots(aid: int, page_size: int = 100) -> dict:
@@ -161,22 +175,22 @@ def scrape_auction_lots(aid: int, page_size: int = 100) -> dict:
         )
 
         lots.append({
-            "lot_id": lot_id,
-            "lot_number": lot_number,
-            "title": title,
-            "current_bid": current_bid,
-            "time_remaining": time_remaining,
+            "lot_id":            lot_id,
+            "lot_number":        lot_number,
+            "title":             title,
+            "current_bid":       current_bid,
+            "time_remaining":    time_remaining,
             "seconds_remaining": seconds_remaining,
-            "image_url": image_url,
-            "url": f"{BASE_URL}/{href}",
+            "image_url":         image_url,
+            "url":               f"{BASE_URL}/{href}",
         })
 
     return {
-        "auction_id": aid,
+        "auction_id": str(aid),
         "page_title": page_title,
-        "page_info": page_info,
+        "page_info":  page_info,
         "total_lots": len(lots),
-        "lots": lots,
+        "lots":       lots,
     }
 
 
@@ -199,31 +213,72 @@ def print_lots_table(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI argument helpers
+# ---------------------------------------------------------------------------
+
+def _add_db_args(parser: argparse.ArgumentParser) -> None:
+    """Add ADBC connection flags to a subcommand parser."""
+    g = parser.add_argument_group("ADBC / database")
+    g.add_argument("--write-db", action="store_true",
+                   help="Write results via ADBC")
+    g.add_argument("--adbc-driver", default=None, metavar="PATH",
+                   help="ADBC driver path (env: ADBC_DRIVER, default: adbc_driver_flightsql)")
+    g.add_argument("--adbc-uri", default=None, metavar="URI",
+                   help="ADBC connection URI (env: ADBC_URI, default: grpc://localhost:50051)")
+    g.add_argument("--adbc-options", default=None, metavar="JSON",
+                   help='ADBC init options as JSON (env: ADBC_OPTIONS), e.g. \'{"adbc.flight.sql.authorization_header":"Bearer tok"}\'')
+    g.add_argument("--catalog", default=None, metavar="CATALOG",
+                   help="Catalog name for writes (env: ADBC_CATALOG)")
+    g.add_argument("--schema", default=None, metavar="SCHEMA",
+                   help="Schema name for writes (env: ADBC_SCHEMA, default: public)")
+    g.add_argument("--db-mode", default="create_append",
+                   choices=["create_append", "append", "replace"],
+                   help="Ingest mode (default: create_append)")
+
+
+def _build_db_config(args: argparse.Namespace):
+    """Build a DBConfig from parsed args, overriding env defaults where provided."""
+    import json as _json
+    from db import DBConfig
+    cfg = DBConfig()  # reads env vars
+    if args.adbc_driver  is not None: cfg.driver  = args.adbc_driver
+    if args.adbc_uri     is not None: cfg.uri     = args.adbc_uri
+    if args.adbc_options is not None: cfg.options = _json.loads(args.adbc_options)
+    if args.catalog      is not None: cfg.catalog = args.catalog
+    if args.schema       is not None: cfg.schema  = args.schema
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scrape lloydsonline.com.au",
+        description="Scrape lloydsonline.com.au — optionally write via ADBC",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # auctions subcommand
+    # -- auctions subcommand -------------------------------------------------
     p_auctions = sub.add_parser("auctions", help="List all auctions")
     p_auctions.add_argument("--json", action="store_true", help="Print as JSON")
-    p_auctions.add_argument("--out", help="Save JSON to file")
+    p_auctions.add_argument("--out",  metavar="FILE", help="Save JSON to file")
+    _add_db_args(p_auctions)
 
-    # lots subcommand
+    # -- lots subcommand -----------------------------------------------------
     p_lots = sub.add_parser("lots", help="List lots for an auction")
-    p_lots.add_argument("--aid", type=int, required=True, help="Auction ID")
-    p_lots.add_argument("--page-size", type=int, default=100, help="Items per page (default: 100)")
+    p_lots.add_argument("--aid",       type=int, required=True, help="Auction ID")
+    p_lots.add_argument("--page-size", type=int, default=100,
+                        help="Items per page (default: 100)")
     p_lots.add_argument("--json", action="store_true", help="Print as JSON")
-    p_lots.add_argument("--out", help="Save JSON to file")
+    p_lots.add_argument("--out",  metavar="FILE", help="Save JSON to file")
+    _add_db_args(p_lots)
 
     args = parser.parse_args()
 
+    # -------------------------------------------------------------------------
     if args.cmd == "auctions":
         print("Fetching auction list...", file=sys.stderr)
         auctions = scrape_auction_list()
@@ -240,6 +295,16 @@ def main() -> None:
         else:
             print_auction_table(auctions)
 
+        if args.write_db:
+            import db as db_mod
+            cfg = _build_db_config(args)
+            print(f"Connecting to {cfg} ...", file=sys.stderr)
+            with db_mod.connect(cfg) as conn:
+                db_mod.setup(conn, cfg)
+                rows = db_mod.write_auctions(conn, cfg, auctions, mode=args.db_mode)
+            print(f"Wrote {rows} auctions → {cfg}", file=sys.stderr)
+
+    # -------------------------------------------------------------------------
     elif args.cmd == "lots":
         print(f"Fetching lots for auction {args.aid}...", file=sys.stderr)
         data = scrape_auction_lots(args.aid, page_size=args.page_size)
@@ -254,6 +319,17 @@ def main() -> None:
                 print(json.dumps(data, indent=2, ensure_ascii=False))
         else:
             print_lots_table(data)
+
+        if args.write_db:
+            import db as db_mod
+            cfg = _build_db_config(args)
+            print(f"Connecting to {cfg} ...", file=sys.stderr)
+            with db_mod.connect(cfg) as conn:
+                db_mod.setup(conn, cfg)
+                rows = db_mod.write_lots(
+                    conn, cfg, data["lots"], data["auction_id"], mode=args.db_mode
+                )
+            print(f"Wrote {rows} lots → {cfg}", file=sys.stderr)
 
 
 if __name__ == "__main__":
