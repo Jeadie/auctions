@@ -33,6 +33,15 @@ pub enum Error {
         message: String,
     },
 
+    #[snafu(display(
+        "Lot {auction_id}/{lot_id} is missing auctioneer; required for writes to {table}"
+    ))]
+    MissingAuctioneer {
+        table: String,
+        auction_id: String,
+        lot_id: String,
+    },
+
     #[snafu(display("Invalid ADBC options JSON: {source}"))]
     AdbcOptionsJson { source: serde_json::Error },
 

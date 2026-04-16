@@ -283,9 +283,13 @@ impl Db {
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         for chunk in lots.chunks(BATCH_SIZE) {
-            for lot in chunk {
-                ensure_lot_has_auctioneer(lot, &table_label)?;
-            }
+            let validated = chunk
+                .iter()
+                .map(|lot| {
+                    let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
+                    Ok((lot, auctioneer))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             if let Some(delete_sql) = delete_lot_keys_sql(&table_ref, chunk) {
                 self.execute_update(&delete_sql)
@@ -296,7 +300,10 @@ impl Db {
                     })?;
             }
 
-            let values: Vec<String> = chunk.iter().map(|l| format_lot_values(l, &now)).collect();
+            let values = validated
+                .iter()
+                .map(|(lot, auctioneer)| format_lot_values(lot, auctioneer, &now))
+                .collect::<Vec<_>>();
 
             self.execute_update(&format!(
                 "INSERT INTO {table_ref} ({cols}) VALUES {}",
@@ -358,28 +365,21 @@ impl Db {
         let cols = "auctioneer, auction_id, lot_id, bid, scraped_at";
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        for lot in lots {
-            ensure_lot_has_auctioneer(lot, &table_label)?;
-        }
-
         for chunk in lots.chunks(BATCH_SIZE) {
             let values = chunk
                 .iter()
                 .map(|lot| {
-                    let auctioneer = lot
-                        .auctioneer
-                        .as_deref()
-                        .expect("auctioneer is validated above to be present");
+                    let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
 
-                    format!(
+                    Ok(format!(
                         "({}, {}, {}, {}, '{now}')",
                         lit(auctioneer),
                         lit(&lot.auction_id),
                         lit(&lot.lot_id),
                         lit_opt(lot.current_bid.as_deref()),
-                    )
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
 
             self.execute_update(&format!(
                 "INSERT INTO {table_ref} ({cols}) VALUES {}",
@@ -407,22 +407,14 @@ fn ensure_lot_has_auctioneer<'a>(lot: &'a Lot, table_label: &str) -> Result<&'a 
     lot.auctioneer
         .as_deref()
         .filter(|auctioneer| !auctioneer.is_empty())
-        .ok_or_else(|| Error::DbWrite {
-            rows: 1,
+        .ok_or_else(|| Error::MissingAuctioneer {
             table: table_label.to_owned(),
-            message: format!(
-                "lot {} is missing auctioneer, required for primary key",
-                lot.lot_id
-            ),
+            auction_id: lot.auction_id.clone(),
+            lot_id: lot.lot_id.clone(),
         })
 }
 
-fn format_lot_values(lot: &Lot, now: &str) -> String {
-    let auctioneer = lot
-        .auctioneer
-        .as_deref()
-        .expect("auctioneer is validated before SQL formatting");
-
+fn format_lot_values(lot: &Lot, auctioneer: &str, now: &str) -> String {
     format!(
         "({}, {}, {}, {}, {}, {}, {}, '{now}')",
         lit(&lot.lot_id),
@@ -533,9 +525,10 @@ fn truncate_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DbConfig, delete_auction_keys_sql, delete_lot_keys_sql, insert_lot_if_missing_sql, lit,
-        lit_bool, lit_opt, quote_ident,
+        DbConfig, delete_auction_keys_sql, delete_lot_keys_sql, ensure_lot_has_auctioneer,
+        insert_lot_if_missing_sql, lit, lit_bool, lit_opt, quote_ident,
     };
+    use crate::error::Error;
     use crate::models::{Auction, Lot};
 
     #[test]
@@ -668,6 +661,32 @@ mod tests {
             sql,
             "DELETE FROM \"s\".\"lots\" WHERE (auctioneer = 'Lloyds' AND auction_id = 'A' AND lot_id = '1') OR (auctioneer = 'Lloyds' AND auction_id = 'A' AND lot_id = '2')"
         );
+    }
+
+    #[test]
+    fn ensure_lot_has_auctioneer_returns_typed_error() {
+        let lot = Lot {
+            lot_id: "123".to_owned(),
+            auction_id: "A1".to_owned(),
+            auctioneer: None,
+            lot_number: Some("12".to_owned()),
+            title: Some("Vintage Guitar".to_owned()),
+            current_bid: Some("$100".to_owned()),
+            time_remaining: Some("1h".to_owned()),
+            seconds_remaining: Some(3600),
+            image_url: Some("https://example.com/l.png".to_owned()),
+            url: "https://example.com/lot/123".to_owned(),
+        };
+
+        let err = ensure_lot_has_auctioneer(&lot, "public.lots").expect_err("should fail");
+        assert!(matches!(
+            err,
+            Error::MissingAuctioneer {
+                table,
+                auction_id,
+                lot_id
+            } if table == "public.lots" && auction_id == "A1" && lot_id == "123"
+        ));
     }
 
     #[test]

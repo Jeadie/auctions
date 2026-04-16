@@ -142,26 +142,8 @@ fn run(cli: Cli) -> Result<()> {
 
     loop {
         let cycle_started = Instant::now();
-
-        match run_cycle(&client, &mut database, &cli) {
-            Ok(stats) => {
-                status(
-                    cli.quiet,
-                    format!(
-                        "Cycle complete: {} auctions updated, {} auctions processed, {} skipped, {} lots seen, {} new lots appended, {} lot-price rows written",
-                        stats.auctions_written,
-                        stats.auctions_processed,
-                        stats.auctions_skipped,
-                        stats.lots_seen,
-                        stats.lots_appended,
-                        stats.lot_price_rows
-                    ),
-                );
-            }
-            Err(err) => {
-                status(cli.quiet, format!("Cycle failed: {err}"));
-            }
-        }
+        let cycle_result = run_cycle(&client, &mut database, &cli);
+        handle_cycle_result(cycle_result, cli.quiet, cli.once)?;
 
         if cli.once {
             break;
@@ -170,6 +152,33 @@ fn run(cli: Cli) -> Result<()> {
         let elapsed = cycle_started.elapsed();
         if elapsed < interval {
             thread::sleep(interval - elapsed);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_cycle_result(cycle_result: Result<CycleStats>, quiet: bool, once: bool) -> Result<()> {
+    match cycle_result {
+        Ok(stats) => {
+            status(
+                quiet,
+                format!(
+                    "Cycle complete: {} auctions updated, {} auctions processed, {} skipped, {} lots seen, {} new lots appended, {} lot-price rows written",
+                    stats.auctions_written,
+                    stats.auctions_processed,
+                    stats.auctions_skipped,
+                    stats.lots_seen,
+                    stats.lots_appended,
+                    stats.lot_price_rows
+                ),
+            );
+        }
+        Err(err) => {
+            if once {
+                return Err(err);
+            }
+            status(quiet, format!("Cycle failed: {err}"));
         }
     }
 
@@ -254,7 +263,8 @@ fn auction_id_filter(aid: &[u64]) -> Option<HashSet<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, auction_id_filter};
+    use super::{Cli, CycleStats, auction_id_filter, handle_cycle_result};
+    use auctions::error::Error;
     use clap::Parser;
 
     #[test]
@@ -275,5 +285,54 @@ mod tests {
         assert_eq!(cli.interval_seconds, 60);
         assert_eq!(cli.page_size, 100);
         assert_eq!(cli.db.schema, "public");
+    }
+
+    #[test]
+    fn once_mode_propagates_cycle_errors() {
+        let err = handle_cycle_result(
+            Err(Error::ParseAuctions {
+                message: "boom".to_owned(),
+            }),
+            true,
+            true,
+        )
+        .expect_err("once mode should return cycle errors");
+
+        assert!(matches!(err, Error::ParseAuctions { .. }));
+    }
+
+    #[test]
+    fn continuous_mode_swallows_cycle_errors_and_keeps_running() {
+        handle_cycle_result(
+            Err(Error::ParseAuctions {
+                message: "boom".to_owned(),
+            }),
+            true,
+            false,
+        )
+        .expect("continuous mode should continue after cycle errors");
+    }
+
+    #[test]
+    fn successful_cycle_always_returns_ok() {
+        let stats = CycleStats {
+            auctions_written: 1,
+            auctions_processed: 1,
+            auctions_skipped: 0,
+            lots_seen: 10,
+            lots_appended: 2,
+            lot_price_rows: 10,
+        };
+
+        handle_cycle_result(Ok(stats), true, true).expect("success should pass in once mode");
+        handle_cycle_result(
+            Ok(CycleStats {
+                auctions_written: 1,
+                ..CycleStats::default()
+            }),
+            true,
+            false,
+        )
+        .expect("success should pass in continuous mode");
     }
 }
