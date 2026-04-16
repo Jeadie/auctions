@@ -115,7 +115,7 @@ Defaults when DB mode is enabled:
 
 - `auctions` primary key: `(auction_id)`
 - `lots` primary key: `(auctioneer, auction_id, lot_id)`
-  - includes `description`, `location`, and `lot_images` (JSON array string)
+  - includes `description`, `location`, and `lot_images` as `List(Utf8)` / `VARCHAR[]`
 - `lot_prices`: append-only bid snapshots (no primary key; one row per scrape)
 
 ## Developer checks
