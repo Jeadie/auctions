@@ -5,8 +5,7 @@ name: auctions
 runtime:
   flight:
     do_put_rate_limit_enabled: false
-    max_message_size: null
-    
+
 catalogs:
   - from: cayenne
     name: foo
