@@ -7,11 +7,13 @@ use adbc_core::{
 use adbc_driver_manager::ManagedDriver;
 use chrono::Utc;
 
-use crate::cli::DbArgs;
 use crate::error::{Error, Result};
 use crate::models::{Auction, Lot};
 
 const AUTH_HEADER_KEY: &str = "adbc.flight.sql.authorization_header";
+const DEFAULT_ADBC_DRIVER: &str = "adbc_driver_flightsql";
+const DEFAULT_ADBC_URI: &str = "grpc://localhost:50051";
+const DEFAULT_SCHEMA: &str = "public";
 const BATCH_SIZE: usize = 200;
 
 pub struct DbConfig {
@@ -23,8 +25,14 @@ pub struct DbConfig {
 }
 
 impl DbConfig {
-    pub fn from_args(args: &DbArgs) -> Result<Self> {
-        let options = match &args.adbc_options {
+    pub fn from_parts(
+        adbc_driver: Option<&str>,
+        adbc_uri: Option<&str>,
+        adbc_options_json: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+    ) -> Result<Self> {
+        let options = match adbc_options_json.filter(|json| !json.trim().is_empty()) {
             None => HashMap::new(),
             Some(json) => {
                 serde_json::from_str(json).map_err(|e| Error::AdbcOptionsJson { source: e })?
@@ -32,17 +40,24 @@ impl DbConfig {
         };
 
         Ok(Self {
-            driver: args
-                .adbc_driver
-                .clone()
-                .unwrap_or_else(|| "adbc_driver_flightsql".to_owned()),
-            uri: args
-                .adbc_uri
-                .clone()
-                .unwrap_or_else(|| "grpc://localhost:50051".to_owned()),
+            driver: adbc_driver
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEFAULT_ADBC_DRIVER)
+                .to_owned(),
+            uri: adbc_uri
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEFAULT_ADBC_URI)
+                .to_owned(),
             options,
-            catalog: args.catalog.clone(),
-            schema: args.schema.clone(),
+            catalog: catalog
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            schema: schema
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_SCHEMA)
+                .to_owned(),
         })
     }
 
@@ -133,18 +148,19 @@ impl Db {
         Ok(Self { conn, config })
     }
 
-    fn execute_update(&mut self, sql: &str) -> std::result::Result<(), String> {
+    fn execute_update(&mut self, sql: &str) -> std::result::Result<u64, String> {
         let mut stmt = self.conn.new_statement().map_err(|e| e.to_string())?;
         stmt.set_sql_query(sql).map_err(|e| e.to_string())?;
-        stmt.execute_update().map_err(|e| e.to_string())?;
-        Ok(())
+        let affected = stmt.execute_update().map_err(|e| e.to_string())?;
+        Ok(affected.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
     }
 
     fn execute_setup(&mut self, sql: &str) -> Result<()> {
         self.execute_update(sql).map_err(|message| Error::DbSetup {
             query: truncate_sql(sql),
             message,
-        })
+        })?;
+        Ok(())
     }
 
     pub fn setup(&mut self) -> Result<()> {
@@ -173,20 +189,28 @@ impl Db {
 
         self.execute_setup(&format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                lot_id            VARCHAR NOT NULL,
-                auction_id        VARCHAR NOT NULL,
-                auctioneer        VARCHAR NOT NULL,
-                lot_number        VARCHAR,
-                title             VARCHAR,
-                current_bid       VARCHAR,
-                time_remaining    VARCHAR,
-                seconds_remaining BIGINT,
-                image_url         VARCHAR,
-                url               VARCHAR,
-                scraped_at        TIMESTAMP,
+                lot_id      VARCHAR NOT NULL,
+                auction_id  VARCHAR NOT NULL,
+                auctioneer  VARCHAR NOT NULL,
+                lot_number  VARCHAR,
+                title       VARCHAR,
+                image_url   VARCHAR,
+                url         VARCHAR,
+                scraped_at  TIMESTAMP,
                 PRIMARY KEY (auctioneer, auction_id, lot_id)
             )",
             self.config.table_ref_quoted("lots")
+        ))?;
+
+        self.execute_setup(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                auctioneer  VARCHAR NOT NULL,
+                auction_id  VARCHAR NOT NULL,
+                lot_id      VARCHAR NOT NULL,
+                bid         VARCHAR,
+                scraped_at  TIMESTAMP NOT NULL
+            )",
+            self.config.table_ref_quoted("lot_prices")
         ))?;
 
         Ok(())
@@ -255,21 +279,12 @@ impl Db {
         let table_ref = self.config.table_ref_quoted("lots");
         let table_label = format!("{}.lots", self.config.schema_ref());
 
-        let cols = "lot_id, auction_id, auctioneer, lot_number, title, current_bid, time_remaining, seconds_remaining, image_url, url, scraped_at";
+        let cols = "lot_id, auction_id, auctioneer, lot_number, title, image_url, url, scraped_at";
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         for chunk in lots.chunks(BATCH_SIZE) {
             for lot in chunk {
-                if lot.auctioneer.as_deref().is_none_or(str::is_empty) {
-                    return Err(Error::DbWrite {
-                        rows: 1,
-                        table: table_label.clone(),
-                        message: format!(
-                            "lot {} is missing auctioneer, required for primary key",
-                            lot.lot_id
-                        ),
-                    });
-                }
+                ensure_lot_has_auctioneer(lot, &table_label)?;
             }
 
             if let Some(delete_sql) = delete_lot_keys_sql(&table_ref, chunk) {
@@ -281,29 +296,7 @@ impl Db {
                     })?;
             }
 
-            let values: Vec<String> = chunk
-                .iter()
-                .map(|l| {
-                    let auctioneer = match l.auctioneer.as_deref() {
-                        Some(auctioneer) if !auctioneer.is_empty() => auctioneer,
-                        _ => "",
-                    };
-
-                    format!(
-                        "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{now}')",
-                        lit(&l.lot_id),
-                        lit(&l.auction_id),
-                        lit(auctioneer),
-                        lit_opt(l.lot_number.as_deref()),
-                        lit_opt(l.title.as_deref()),
-                        lit_opt(l.current_bid.as_deref()),
-                        lit_opt(l.time_remaining.as_deref()),
-                        lit_opt_i64(l.seconds_remaining),
-                        lit_opt(l.image_url.as_deref()),
-                        lit(&l.url)
-                    )
-                })
-                .collect();
+            let values: Vec<String> = chunk.iter().map(|l| format_lot_values(l, &now)).collect();
 
             self.execute_update(&format!(
                 "INSERT INTO {table_ref} ({cols}) VALUES {}",
@@ -319,12 +312,150 @@ impl Db {
         tracing::info!(rows = lots.len(), table = %table_label, "wrote lots");
         Ok(lots.len())
     }
+
+    /// Insert only lots that do not already exist by `(auctioneer, auction_id, lot_id)`.
+    pub fn append_new_lots(&mut self, lots: &[Lot]) -> Result<usize> {
+        if lots.is_empty() {
+            return Ok(0);
+        }
+
+        let table_ref = self.config.table_ref_quoted("lots");
+        let table_label = format!("{}.lots", self.config.schema_ref());
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let mut inserted = 0usize;
+
+        for lot in lots {
+            let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
+            let sql = insert_lot_if_missing_sql(&table_ref, lot, auctioneer, &now);
+            let affected = self
+                .execute_update(&sql)
+                .map_err(|message| Error::DbWrite {
+                    rows: 1,
+                    table: table_label.clone(),
+                    message,
+                })?;
+            inserted += affected as usize;
+        }
+
+        tracing::info!(
+            attempted = lots.len(),
+            inserted,
+            table = %table_label,
+            "appended new lots"
+        );
+        Ok(inserted)
+    }
+
+    /// Append a price snapshot for every lot in this scrape pass.
+    pub fn append_lot_prices(&mut self, lots: &[Lot]) -> Result<usize> {
+        if lots.is_empty() {
+            return Ok(0);
+        }
+
+        let table_ref = self.config.table_ref_quoted("lot_prices");
+        let table_label = format!("{}.lot_prices", self.config.schema_ref());
+        let cols = "auctioneer, auction_id, lot_id, bid, scraped_at";
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        for lot in lots {
+            ensure_lot_has_auctioneer(lot, &table_label)?;
+        }
+
+        for chunk in lots.chunks(BATCH_SIZE) {
+            let values = chunk
+                .iter()
+                .map(|lot| {
+                    let auctioneer = lot
+                        .auctioneer
+                        .as_deref()
+                        .expect("auctioneer is validated above to be present");
+
+                    format!(
+                        "({}, {}, {}, {}, '{now}')",
+                        lit(auctioneer),
+                        lit(&lot.auction_id),
+                        lit(&lot.lot_id),
+                        lit_opt(lot.current_bid.as_deref()),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            self.execute_update(&format!(
+                "INSERT INTO {table_ref} ({cols}) VALUES {}",
+                values.join(", ")
+            ))
+            .map_err(|message| Error::DbWrite {
+                rows: chunk.len(),
+                table: table_label.clone(),
+                message,
+            })?;
+        }
+
+        tracing::info!(rows = lots.len(), table = %table_label, "wrote lot price snapshots");
+        Ok(lots.len())
+    }
 }
 
 impl std::fmt::Display for DbConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.display())
     }
+}
+
+fn ensure_lot_has_auctioneer<'a>(lot: &'a Lot, table_label: &str) -> Result<&'a str> {
+    lot.auctioneer
+        .as_deref()
+        .filter(|auctioneer| !auctioneer.is_empty())
+        .ok_or_else(|| Error::DbWrite {
+            rows: 1,
+            table: table_label.to_owned(),
+            message: format!(
+                "lot {} is missing auctioneer, required for primary key",
+                lot.lot_id
+            ),
+        })
+}
+
+fn format_lot_values(lot: &Lot, now: &str) -> String {
+    let auctioneer = lot
+        .auctioneer
+        .as_deref()
+        .expect("auctioneer is validated before SQL formatting");
+
+    format!(
+        "({}, {}, {}, {}, {}, {}, {}, '{now}')",
+        lit(&lot.lot_id),
+        lit(&lot.auction_id),
+        lit(auctioneer),
+        lit_opt(lot.lot_number.as_deref()),
+        lit_opt(lot.title.as_deref()),
+        lit_opt(lot.image_url.as_deref()),
+        lit(&lot.url)
+    )
+}
+
+fn insert_lot_if_missing_sql(table_ref: &str, lot: &Lot, auctioneer: &str, now: &str) -> String {
+    format!(
+        "INSERT INTO {table_ref} \
+         (lot_id, auction_id, auctioneer, lot_number, title, image_url, url, scraped_at) \
+         SELECT {}, {}, {}, {}, {}, {}, {}, '{}' \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM {table_ref} \
+             WHERE auctioneer = {} AND auction_id = {} AND lot_id = {}\
+         )",
+        lit(&lot.lot_id),
+        lit(&lot.auction_id),
+        lit(auctioneer),
+        lit_opt(lot.lot_number.as_deref()),
+        lit_opt(lot.title.as_deref()),
+        lit_opt(lot.image_url.as_deref()),
+        lit(&lot.url),
+        now,
+        lit(auctioneer),
+        lit(&lot.auction_id),
+        lit(&lot.lot_id),
+    )
 }
 
 fn delete_auction_keys_sql(table_ref: &str, auctions: &[Auction]) -> Option<String> {
@@ -390,13 +521,6 @@ fn lit_bool(b: bool) -> &'static str {
     if b { "TRUE" } else { "FALSE" }
 }
 
-fn lit_opt_i64(n: Option<i64>) -> String {
-    match n {
-        None => "NULL".to_owned(),
-        Some(n) => n.to_string(),
-    }
-}
-
 fn truncate_sql(sql: &str) -> String {
     let trimmed = sql.trim();
     if trimmed.len() > 80 {
@@ -409,10 +533,38 @@ fn truncate_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_auction_keys_sql, delete_lot_keys_sql, lit, lit_bool, lit_opt, lit_opt_i64,
-        quote_ident,
+        DbConfig, delete_auction_keys_sql, delete_lot_keys_sql, insert_lot_if_missing_sql, lit,
+        lit_bool, lit_opt, quote_ident,
     };
     use crate::models::{Auction, Lot};
+
+    #[test]
+    fn db_config_from_parts_applies_defaults() {
+        let cfg = DbConfig::from_parts(None, None, None, None, None).expect("config should build");
+        assert_eq!(cfg.driver, "adbc_driver_flightsql");
+        assert_eq!(cfg.uri, "grpc://localhost:50051");
+        assert_eq!(cfg.schema, "public");
+        assert!(cfg.catalog.is_none());
+    }
+
+    #[test]
+    fn db_config_from_parts_parses_options_json() {
+        let cfg = DbConfig::from_parts(
+            None,
+            None,
+            Some("{\"adbc.flight.sql.authorization_header\":\"abc\"}"),
+            Some("spice"),
+            Some("auctions_data"),
+        )
+        .expect("config should build");
+
+        assert_eq!(
+            cfg.options.get("adbc.flight.sql.authorization_header"),
+            Some(&"abc".to_owned())
+        );
+        assert_eq!(cfg.catalog.as_deref(), Some("spice"));
+        assert_eq!(cfg.schema, "auctions_data");
+    }
 
     #[test]
     fn quote_ident_escapes_double_quotes() {
@@ -428,11 +580,9 @@ mod tests {
     }
 
     #[test]
-    fn numeric_and_boolean_literals_render_cleanly() {
+    fn boolean_literals_render_cleanly() {
         assert_eq!(lit_bool(true), "TRUE");
         assert_eq!(lit_bool(false), "FALSE");
-        assert_eq!(lit_opt_i64(Some(42)), "42");
-        assert_eq!(lit_opt_i64(None), "NULL");
     }
 
     #[test]
@@ -518,5 +668,29 @@ mod tests {
             sql,
             "DELETE FROM \"s\".\"lots\" WHERE (auctioneer = 'Lloyds' AND auction_id = 'A' AND lot_id = '1') OR (auctioneer = 'Lloyds' AND auction_id = 'A' AND lot_id = '2')"
         );
+    }
+
+    #[test]
+    fn insert_lot_if_missing_sql_checks_composite_key() {
+        let lot = Lot {
+            lot_id: "123".to_owned(),
+            auction_id: "A1".to_owned(),
+            auctioneer: Some("Lloyds".to_owned()),
+            lot_number: Some("12".to_owned()),
+            title: Some("Vintage Guitar".to_owned()),
+            current_bid: Some("$100".to_owned()),
+            time_remaining: Some("1h".to_owned()),
+            seconds_remaining: Some(3600),
+            image_url: Some("https://example.com/l.png".to_owned()),
+            url: "https://example.com/lot/123".to_owned(),
+        };
+
+        let sql =
+            insert_lot_if_missing_sql("\"s\".\"lots\"", &lot, "Lloyds", "2026-04-16 12:00:00");
+
+        assert!(sql.contains("WHERE NOT EXISTS"));
+        assert!(sql.contains("auctioneer = 'Lloyds'"));
+        assert!(sql.contains("auction_id = 'A1'"));
+        assert!(sql.contains("lot_id = '123'"));
     }
 }

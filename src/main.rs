@@ -1,17 +1,10 @@
-mod cli;
-mod db;
-mod error;
-mod models;
-mod scraper;
-
+use auctions::cli::{Cli, Command};
+use auctions::error::{Error, Result};
+use auctions::models::{AuctionList, LotList};
+use auctions::{db, scraper};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
-use snafu::ResultExt;
 use tracing::level_filters::LevelFilter;
-
-use crate::cli::{Cli, Command};
-use crate::error::{Error, JsonSnafu, Result};
-use crate::models::{AuctionList, LotList};
 
 fn main() {
     let cli = Cli::parse();
@@ -68,18 +61,13 @@ fn run(cli: Cli) -> Result<()> {
             };
 
             if args.db.writes_to_db() {
-                let cfg = db::DbConfig::from_args(&args.db)?;
-                status(cli.quiet, format!("Connecting to {cfg} …"));
+                let cfg = db_config_from_args(&args.db)?;
+                let target = cfg.to_string();
+                status(cli.quiet, format!("Connecting to {target} …"));
                 let mut db = db::Db::connect(cfg)?;
                 db.setup()?;
                 let rows = db.write_auctions(&list.auctions)?;
-                status(
-                    cli.quiet,
-                    format!(
-                        "Wrote {rows} auctions → {}",
-                        db::DbConfig::from_args(&args.db)?
-                    ),
-                );
+                status(cli.quiet, format!("Wrote {rows} auctions → {target}"));
             } else {
                 write_json_output(&list)?;
             }
@@ -107,15 +95,13 @@ fn run(cli: Cli) -> Result<()> {
                     lot.auctioneer = Some(auctioneer.clone());
                 }
 
-                let cfg = db::DbConfig::from_args(&args.db)?;
-                status(cli.quiet, format!("Connecting to {cfg} …"));
+                let cfg = db_config_from_args(&args.db)?;
+                let target = cfg.to_string();
+                status(cli.quiet, format!("Connecting to {target} …"));
                 let mut db = db::Db::connect(cfg)?;
                 db.setup()?;
                 let rows = db.write_lots(&list.lots)?;
-                status(
-                    cli.quiet,
-                    format!("Wrote {rows} lots → {}", db::DbConfig::from_args(&args.db)?),
-                );
+                status(cli.quiet, format!("Wrote {rows} lots → {target}"));
             } else {
                 write_json_output(&list)?;
             }
@@ -123,6 +109,16 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn db_config_from_args(args: &auctions::cli::DbArgs) -> Result<db::DbConfig> {
+    db::DbConfig::from_parts(
+        args.adbc_driver.as_deref(),
+        args.adbc_uri.as_deref(),
+        args.adbc_options.as_deref(),
+        args.catalog.as_deref(),
+        Some(&args.schema),
+    )
 }
 
 fn resolve_auctioneer(client: &scraper::LloydsClient, auction_id: u64) -> Result<String> {
@@ -148,7 +144,7 @@ fn resolve_auctioneer(client: &scraper::LloydsClient, auction_id: u64) -> Result
 }
 
 fn write_json_output<T: serde::Serialize>(data: &T) -> Result<()> {
-    let json = serde_json::to_string_pretty(data).context(JsonSnafu)?;
+    let json = serde_json::to_string_pretty(data).map_err(|source| Error::Json { source })?;
     println!("{json}");
     Ok(())
 }

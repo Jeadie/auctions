@@ -1,20 +1,22 @@
 # auctions (Rust)
 
-CLI scraper for [lloydsonline.com.au](https://www.lloydsonline.com.au).
+CLI scrapers for [lloydsonline.com.au](https://www.lloydsonline.com.au).
 
-## Behavior
-
-- If **`--adbc-uri`** or **`--adbc-driver`** is provided, the command writes to the database via ADBC.
-- Otherwise, the command prints JSON to stdout.
+- `auctions`: one-shot fetcher (`list`, `lots`, `completions`)
+- `auctions-sync`: continuous DB updater for auctions + lots + lot price history
 
 ## Build
 
 ```bash
 cargo build
 cargo run -- --help
+cargo run --bin auctions-sync -- --help
 ```
 
-## Usage
+## `auctions` behavior
+
+- If **`--adbc-uri`** or **`--adbc-driver`** is provided, writes to DB via ADBC.
+- Otherwise, prints JSON to stdout.
 
 ### List auctions
 
@@ -22,7 +24,7 @@ cargo run -- --help
 # JSON to stdout
 auctions list
 
-# Write to DB (ADBC enabled by --adbc-uri)
+# Write to DB
 auctions list --adbc-uri grpc://localhost:50051
 ```
 
@@ -32,27 +34,47 @@ auctions list --adbc-uri grpc://localhost:50051
 # JSON to stdout
 auctions lots --aid 67956
 
-# Write to DB (ADBC enabled by --adbc-driver)
+# Write to DB
 auctions lots --aid 67956 --adbc-driver adbc_driver_flightsql
 ```
 
-### ADBC options
+### Shell completions
 
-Optional with DB mode:
+```bash
+auctions completions zsh > ~/.zsh/completions/_auctions
+```
+
+## `auctions-sync` behavior
+
+`auctions-sync` is intended for long-running ingestion.
+
+Per cycle it:
+
+1. Scrapes auction list and upserts `auctions`.
+2. Scrapes lots for each selected auction.
+3. Appends **only new lots** into `lots` (existing lot keys are left untouched).
+4. Appends a row per lot into `lot_prices` so bid changes are tracked over time.
+
+### Example
+
+```bash
+# run forever (default 60s interval)
+auctions-sync --adbc-uri grpc://localhost:50051
+
+# run once (useful for cron / smoke testing)
+auctions-sync --once
+
+# only track specific auctions
+auctions-sync --aid 67956 --aid 67957 --interval-seconds 30
+```
+
+## ADBC options
+
+Optional in DB mode:
 
 - `--adbc-options '{"adbc.flight.sql.authorization_header":"mytoken"}'`
 - `--catalog spice`
 - `--schema auctions_data`
-
-Write behavior is always key-based upsert:
-
-- delete rows that match incoming primary keys
-- insert fresh rows
-
-Primary keys used by the schema:
-
-- `auctions`: `(auction_id)`
-- `lots`: `(auctioneer, auction_id, lot_id)`
 
 Defaults when DB mode is enabled:
 
@@ -60,11 +82,11 @@ Defaults when DB mode is enabled:
 - Driver: `adbc_driver_flightsql`
 - Schema: `public`
 
-### Shell completions
+## Tables
 
-```bash
-auctions completions zsh > ~/.zsh/completions/_auctions
-```
+- `auctions` primary key: `(auction_id)`
+- `lots` primary key: `(auctioneer, auction_id, lot_id)`
+- `lot_prices`: append-only bid snapshots (no primary key; one row per scrape)
 
 ## Developer checks
 

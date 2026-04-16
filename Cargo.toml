@@ -2,11 +2,16 @@
 name        = "auctions"
 version     = "0.1.0"
 edition     = "2024"
+default-run = "auctions"
 description = "Scrape lloydsonline.com.au auction data and write to a database via ADBC"
 
 [[bin]]
 name = "auctions"
 path = "src/main.rs"
+
+[[bin]]
+name = "auctions-sync"
+path = "src/bin/auctions-sync.rs"
 
 [dependencies]
 # CLI
