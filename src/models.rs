@@ -25,6 +25,10 @@ pub struct Lot {
     pub time_remaining: Option<String>,
     pub seconds_remaining: Option<i64>,
     pub image_url: Option<String>,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    #[serde(default)]
+    pub lot_images: Vec<String>,
     pub url: String,
 }
 

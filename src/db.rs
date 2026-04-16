@@ -189,14 +189,17 @@ impl Db {
 
         self.execute_setup(&format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                lot_id      VARCHAR NOT NULL,
-                auction_id  VARCHAR NOT NULL,
-                auctioneer  VARCHAR NOT NULL,
-                lot_number  VARCHAR,
-                title       VARCHAR,
-                image_url   VARCHAR,
-                url         VARCHAR,
-                scraped_at  TIMESTAMP,
+                lot_id       VARCHAR NOT NULL,
+                auction_id   VARCHAR NOT NULL,
+                auctioneer   VARCHAR NOT NULL,
+                lot_number   VARCHAR,
+                title        VARCHAR,
+                image_url    VARCHAR,
+                description  VARCHAR,
+                location     VARCHAR,
+                lot_images   VARCHAR,
+                url          VARCHAR,
+                scraped_at   TIMESTAMP,
                 PRIMARY KEY (auctioneer, auction_id, lot_id)
             )",
             self.config.table_ref_quoted("lots")
@@ -279,7 +282,7 @@ impl Db {
         let table_ref = self.config.table_ref_quoted("lots");
         let table_label = format!("{}.lots", self.config.schema_ref());
 
-        let cols = "lot_id, auction_id, auctioneer, lot_number, title, image_url, url, scraped_at";
+        let cols = "lot_id, auction_id, auctioneer, lot_number, title, image_url, description, location, lot_images, url, scraped_at";
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         for chunk in lots.chunks(BATCH_SIZE) {
@@ -303,7 +306,7 @@ impl Db {
             let values = validated
                 .iter()
                 .map(|(lot, auctioneer)| format_lot_values(lot, auctioneer, &now))
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
 
             self.execute_update(&format!(
                 "INSERT INTO {table_ref} ({cols}) VALUES {}",
@@ -334,7 +337,7 @@ impl Db {
 
         for lot in lots {
             let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
-            let sql = insert_lot_if_missing_sql(&table_ref, lot, auctioneer, &now);
+            let sql = insert_lot_if_missing_sql(&table_ref, lot, auctioneer, &now)?;
             let affected = self
                 .execute_update(&sql)
                 .map_err(|message| Error::DbWrite {
@@ -414,24 +417,32 @@ fn ensure_lot_has_auctioneer<'a>(lot: &'a Lot, table_label: &str) -> Result<&'a 
         })
 }
 
-fn format_lot_values(lot: &Lot, auctioneer: &str, now: &str) -> String {
-    format!(
-        "({}, {}, {}, {}, {}, {}, {}, '{now}')",
+fn format_lot_values(lot: &Lot, auctioneer: &str, now: &str) -> Result<String> {
+    Ok(format!(
+        "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{now}')",
         lit(&lot.lot_id),
         lit(&lot.auction_id),
         lit(auctioneer),
         lit_opt(lot.lot_number.as_deref()),
         lit_opt(lot.title.as_deref()),
         lit_opt(lot.image_url.as_deref()),
+        lit_opt(lot.description.as_deref()),
+        lit_opt(lot.location.as_deref()),
+        lit_opt_json_array(&lot.lot_images)?,
         lit(&lot.url)
-    )
+    ))
 }
 
-fn insert_lot_if_missing_sql(table_ref: &str, lot: &Lot, auctioneer: &str, now: &str) -> String {
-    format!(
+fn insert_lot_if_missing_sql(
+    table_ref: &str,
+    lot: &Lot,
+    auctioneer: &str,
+    now: &str,
+) -> Result<String> {
+    Ok(format!(
         "INSERT INTO {table_ref} \
-         (lot_id, auction_id, auctioneer, lot_number, title, image_url, url, scraped_at) \
-         SELECT {}, {}, {}, {}, {}, {}, {}, '{}' \
+         (lot_id, auction_id, auctioneer, lot_number, title, image_url, description, location, lot_images, url, scraped_at) \
+         SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}' \
          WHERE NOT EXISTS (\
              SELECT 1 FROM {table_ref} \
              WHERE auctioneer = {} AND auction_id = {} AND lot_id = {}\
@@ -442,12 +453,15 @@ fn insert_lot_if_missing_sql(table_ref: &str, lot: &Lot, auctioneer: &str, now: 
         lit_opt(lot.lot_number.as_deref()),
         lit_opt(lot.title.as_deref()),
         lit_opt(lot.image_url.as_deref()),
+        lit_opt(lot.description.as_deref()),
+        lit_opt(lot.location.as_deref()),
+        lit_opt_json_array(&lot.lot_images)?,
         lit(&lot.url),
         now,
         lit(auctioneer),
         lit(&lot.auction_id),
         lit(&lot.lot_id),
-    )
+    ))
 }
 
 fn delete_auction_keys_sql(table_ref: &str, auctions: &[Auction]) -> Option<String> {
@@ -509,6 +523,15 @@ fn lit_opt(s: Option<&str>) -> String {
     }
 }
 
+fn lit_opt_json_array(values: &[String]) -> Result<String> {
+    if values.is_empty() {
+        return Ok("NULL".to_owned());
+    }
+
+    let json = serde_json::to_string(values).map_err(|source| Error::Json { source })?;
+    Ok(lit(&json))
+}
+
 fn lit_bool(b: bool) -> &'static str {
     if b { "TRUE" } else { "FALSE" }
 }
@@ -526,7 +549,7 @@ fn truncate_sql(sql: &str) -> String {
 mod tests {
     use super::{
         DbConfig, delete_auction_keys_sql, delete_lot_keys_sql, ensure_lot_has_auctioneer,
-        insert_lot_if_missing_sql, lit, lit_bool, lit_opt, quote_ident,
+        insert_lot_if_missing_sql, lit, lit_bool, lit_opt, lit_opt_json_array, quote_ident,
     };
     use crate::error::Error;
     use crate::models::{Auction, Lot};
@@ -570,6 +593,13 @@ mod tests {
         assert_eq!(lit("bob's"), "'bob''s'");
         assert_eq!(lit_opt(Some("ok")), "'ok'");
         assert_eq!(lit_opt(None), "NULL");
+    }
+
+    #[test]
+    fn json_array_literals_render_as_quoted_json() {
+        let lit = lit_opt_json_array(&["a".to_owned(), "b".to_owned()]).expect("json literal");
+        assert_eq!(lit, "'[\"a\",\"b\"]'");
+        assert_eq!(lit_opt_json_array(&[]).expect("empty json literal"), "NULL");
     }
 
     #[test]
@@ -640,6 +670,9 @@ mod tests {
                 time_remaining: None,
                 seconds_remaining: None,
                 image_url: None,
+                description: None,
+                location: None,
+                lot_images: Vec::new(),
                 url: "https://example.com/l/1".to_owned(),
             },
             Lot {
@@ -652,6 +685,9 @@ mod tests {
                 time_remaining: None,
                 seconds_remaining: None,
                 image_url: None,
+                description: None,
+                location: None,
+                lot_images: Vec::new(),
                 url: "https://example.com/l/2".to_owned(),
             },
         ];
@@ -675,6 +711,9 @@ mod tests {
             time_remaining: Some("1h".to_owned()),
             seconds_remaining: Some(3600),
             image_url: Some("https://example.com/l.png".to_owned()),
+            description: None,
+            location: None,
+            lot_images: Vec::new(),
             url: "https://example.com/lot/123".to_owned(),
         };
 
@@ -701,15 +740,25 @@ mod tests {
             time_remaining: Some("1h".to_owned()),
             seconds_remaining: Some(3600),
             image_url: Some("https://example.com/l.png".to_owned()),
+            description: Some("Near-new with extras".to_owned()),
+            location: Some("Melbourne, VIC".to_owned()),
+            lot_images: vec![
+                "https://example.com/l-1.png".to_owned(),
+                "https://example.com/l-2.png".to_owned(),
+            ],
             url: "https://example.com/lot/123".to_owned(),
         };
 
         let sql =
-            insert_lot_if_missing_sql("\"s\".\"lots\"", &lot, "Lloyds", "2026-04-16 12:00:00");
+            insert_lot_if_missing_sql("\"s\".\"lots\"", &lot, "Lloyds", "2026-04-16 12:00:00")
+                .expect("sql should build");
 
         assert!(sql.contains("WHERE NOT EXISTS"));
         assert!(sql.contains("auctioneer = 'Lloyds'"));
         assert!(sql.contains("auction_id = 'A1'"));
         assert!(sql.contains("lot_id = '123'"));
+        assert!(sql.contains("description"));
+        assert!(sql.contains("location"));
+        assert!(sql.contains("lot_images"));
     }
 }

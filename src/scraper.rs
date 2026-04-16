@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use scraper::{ElementRef, Html, Selector};
 use snafu::ensure;
 
@@ -10,6 +12,12 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 
 pub struct LloydsClient {
     client: reqwest::blocking::Client,
+}
+
+struct ScrapedLotDetails {
+    description: Option<String>,
+    location: Option<String>,
+    lot_images: Vec<String>,
 }
 
 impl LloydsClient {
@@ -55,7 +63,39 @@ impl LloydsClient {
             "AuctionLots.aspx",
             &[("smode", "0"), ("aid", &aid_s), ("pgs", &pgs_s)],
         )?;
-        parse_lots(&doc, &aid_s)
+
+        let mut scraped = parse_lots(&doc, &aid_s)?;
+
+        for lot in &mut scraped.lots {
+            match self.scrape_lot_details(&aid_s, &lot.lot_id) {
+                Ok(details) => {
+                    lot.description = details.description;
+                    lot.location = details.location;
+                    if lot.image_url.is_none() {
+                        lot.image_url = details.lot_images.first().cloned();
+                    }
+                    lot.lot_images = details.lot_images;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        auction_id = %aid_s,
+                        lot_id = %lot.lot_id,
+                        error = %error,
+                        "failed to scrape lot detail; keeping list-page fields"
+                    );
+                }
+            }
+        }
+
+        Ok(scraped)
+    }
+
+    fn scrape_lot_details(&self, auction_id: &str, lot_id: &str) -> Result<ScrapedLotDetails> {
+        let doc = self.get_html(
+            "LotDetails.aspx",
+            &[("smode", "0"), ("aid", auction_id), ("lid", lot_id)],
+        )?;
+        parse_lot_details(&doc, auction_id, lot_id)
     }
 }
 
@@ -102,6 +142,117 @@ fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
         .map(|i| start + i)
         .unwrap_or(url.len());
     Some(&url[start..end])
+}
+
+fn parse_lot_details(doc: &Html, auction_id: &str, lot_id: &str) -> Result<ScrapedLotDetails> {
+    let description_sel = parse_selector_for_lots("div.label + div.value", auction_id)?;
+    let strong_sel = parse_selector_for_lots("strong", auction_id)?;
+    let carousel_img_sel = parse_selector_for_lots(".carousel-inner img", auction_id)?;
+
+    let description = doc
+        .select(&description_sel)
+        .next()
+        .map(|el| clean_html_block(&el.inner_html()))
+        .filter(|text| !text.is_empty());
+
+    let location = extract_location(doc, &strong_sel)
+        .or_else(|| description.as_deref().and_then(location_from_description));
+
+    let lot_images = extract_lot_images(doc, &carousel_img_sel);
+
+    if description.is_none() && location.is_none() && lot_images.is_empty() {
+        return Err(Error::ParseLots {
+            auction_id: auction_id.to_owned(),
+            message: format!(
+                "lot detail page for lot {lot_id} did not contain description, location, or images"
+            ),
+        });
+    }
+
+    Ok(ScrapedLotDetails {
+        description,
+        location,
+        lot_images,
+    })
+}
+
+fn extract_location(doc: &Html, strong_sel: &Selector) -> Option<String> {
+    for strong in doc.select(strong_sel) {
+        if inner_text(strong).trim() != "Location of item:" {
+            continue;
+        }
+
+        let Some(parent) = strong.parent().and_then(ElementRef::wrap) else {
+            continue;
+        };
+        let full_text = inner_text(parent);
+        let location = full_text
+            .trim()
+            .strip_prefix("Location of item:")?
+            .trim()
+            .to_owned();
+
+        if !location.is_empty() {
+            return Some(location);
+        }
+    }
+
+    None
+}
+
+fn location_from_description(description: &str) -> Option<String> {
+    let marker = "Location of item:";
+    let start = description.find(marker)? + marker.len();
+    let tail = &description[start..];
+    let location = tail
+        .split(" Thinking of financing?")
+        .next()
+        .unwrap_or(tail)
+        .trim()
+        .trim_end_matches('.')
+        .to_owned();
+
+    if location.is_empty() {
+        None
+    } else {
+        Some(location)
+    }
+}
+
+fn extract_lot_images(doc: &Html, carousel_img_sel: &Selector) -> Vec<String> {
+    let mut images = Vec::new();
+    let mut seen = HashSet::new();
+
+    for img in doc.select(carousel_img_sel) {
+        for attr in ["data-src", "src"] {
+            let Some(raw) = img.value().attr(attr) else {
+                continue;
+            };
+
+            let url = absolute_url(raw);
+            if url.contains("preloader.gif") || url.is_empty() {
+                continue;
+            }
+
+            if seen.insert(url.clone()) {
+                images.push(url);
+            }
+        }
+    }
+
+    images
+}
+
+fn clean_html_block(html: &str) -> String {
+    html.replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("\r", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
 }
 
 fn parse_auctions(doc: &Html) -> Result<Vec<Auction>> {
@@ -224,6 +375,9 @@ fn parse_lots(doc: &Html, auction_id: &str) -> Result<ScrapedLots> {
             time_remaining,
             seconds_remaining,
             image_url,
+            description: None,
+            location: None,
+            lot_images: Vec::new(),
             url: absolute_url(href),
         });
     }
@@ -247,7 +401,7 @@ fn parse_lots(doc: &Html, auction_id: &str) -> Result<ScrapedLots> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_auctions, parse_lots, query_param};
+    use super::{parse_auctions, parse_lot_details, parse_lots, query_param};
     use scraper::Html;
 
     #[test]
@@ -321,5 +475,44 @@ mod tests {
         assert_eq!(l.lot_number.as_deref(), Some("12"));
         assert_eq!(l.current_bid.as_deref(), Some("$1,250"));
         assert_eq!(l.seconds_remaining, Some(3600));
+        assert_eq!(l.description, None);
+        assert_eq!(l.location, None);
+        assert!(l.lot_images.is_empty());
+    }
+
+    #[test]
+    fn parse_lot_details_extracts_description_location_and_images() {
+        let html = r#"
+        <html>
+          <body>
+            <div class="label">Description:</div>
+            <div class="value">
+              <p><b>Great caravan</b><br>Near new.</p>
+              <p><strong>Location of item:</strong> Melbourne, VIC, Australia</p>
+            </div>
+            <div class="carousel-inner">
+              <img data-src="https://example.com/image-1.jpg" />
+              <img data-src="https://example.com/image-2.jpg" />
+              <img src="https://example.com/image-2.jpg" />
+            </div>
+          </body>
+        </html>
+        "#;
+
+        let doc = Html::parse_document(html);
+        let details =
+            parse_lot_details(&doc, "67956", "1234").expect("detail parsing should succeed");
+
+        assert!(
+            details
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Great caravan"))
+        );
+        assert_eq!(
+            details.location.as_deref(),
+            Some("Melbourne, VIC, Australia")
+        );
+        assert_eq!(details.lot_images.len(), 2);
     }
 }

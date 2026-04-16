@@ -1,0 +1,7 @@
+kind: Spicepod
+version: v1
+name: auctions
+catalogs:
+  - from: cayenne
+    name: foo
+    access: read_write_create
