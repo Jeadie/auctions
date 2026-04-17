@@ -1,9 +1,18 @@
-# auctions (Rust)
+# auctions
 
-CLI scrapers for [lloydsonline.com.au](https://www.lloydsonline.com.au).
+`auctions` ingests auction data from [lloydsonline.com.au](https://www.lloydsonline.com.au) and writes it into any ADBC compatible database.
 
-- `auctions`: one-shot fetcher (`list`, `lots`, `completions`)
-- `auctions-sync`: continuous DB updater for auctions + lots + lot price history
+## Database
+
+Writes into 3 tables:
+
+1. **`auctions`**: Auctions currently present
+2. **`lots`**: Per-lot detailed information, pricing and image locations.
+3. **`lot_prices`**: Bid pricing, per lot.
+
+`auctions-sync` is designed for repeated runs, or one off updates to the database.
+
+---
 
 ## Build
 
@@ -13,26 +22,21 @@ cargo run -- --help
 cargo run --bin auctions-sync -- --help
 ```
 
-## Spice Flight SQL target (local)
+---
 
-This repo includes `spicepod.yaml` with a writable Cayenne catalog:
+## Quick usage
 
-- catalog: `foo`
-- access: `read_write_create`
-
-Start Spice runtime in one terminal:
+### 1) One-shot JSON output (no DB writes)
 
 ```bash
-spice run
+# auction list as JSON
+cargo run -- list
+
+# lots for one auction as JSON
+cargo run -- lots --aid 67956
 ```
 
-(Optional) pre-create schema manually in Spice SQL:
-
-```sql
-CREATE SCHEMA IF NOT EXISTS foo.public;
-```
-
-Then write to it from this CLI (it will also auto-run `CREATE SCHEMA IF NOT EXISTS` + table DDL):
+### 2) One-shot DB sync
 
 ```bash
 cargo run --bin auctions-sync -- --once \
@@ -42,68 +46,71 @@ cargo run --bin auctions-sync -- --once \
   --schema public
 ```
 
-## `auctions` behavior
-
-- If **`--adbc-uri`** or **`--adbc-driver`** is provided, writes to DB via ADBC.
-- Otherwise, prints JSON to stdout.
-
-### List auctions
+### 3) Continuous sync loop
 
 ```bash
-# JSON to stdout
-auctions list
-
-# Write to DB
-auctions list --adbc-uri grpc://localhost:50051
+cargo run --bin auctions-sync -- \
+  --interval-seconds 60 \
+  --adbc-uri grpc://localhost:50051 \
+  --adbc-driver adbc_driver_flightsql \
+  --catalog foo \
+  --schema public
 ```
 
-### List lots
 
-```bash
-# JSON to stdout
-auctions lots --aid 67956
+## Table schema (created automatically if missing)
 
-# Write to DB
-auctions lots --aid 67956 --adbc-driver adbc_driver_flightsql
-```
+> `setup()` runs `CREATE SCHEMA IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS`.
 
-### Shell completions
+### `auctions`
 
-```bash
-auctions completions zsh > ~/.zsh/completions/_auctions
-```
+Primary key: `(auction_id)`
 
-## `auctions-sync` behavior
+- `auction_id VARCHAR NOT NULL`
+- `title VARCHAR`
+- `date VARCHAR`
+- `state VARCHAR`
+- `auctioneer VARCHAR`
+- `auction_type VARCHAR`
+- `is_live BOOLEAN`
+- `image_url VARCHAR`
+- `details_url VARCHAR`
+- `lots_url VARCHAR`
+- `scraped_at TIMESTAMP`
 
-`auctions-sync` is intended for long-running ingestion.
+### `lots`
 
-Per cycle it:
+Primary key: `(auctioneer, auction_id, lot_id)`
 
-1. Scrapes auction list and upserts `auctions`.
-2. Scrapes lots for each selected auction.
-3. Appends **only new lots** into `lots` (existing lot keys are left untouched).
-4. Appends a row per lot into `lot_prices` so bid changes are tracked over time.
+- `lot_id VARCHAR NOT NULL`
+- `auction_id VARCHAR NOT NULL`
+- `auctioneer VARCHAR NOT NULL`
+- `lot_number VARCHAR`
+- `title VARCHAR`
+- `image_url VARCHAR`
+- `description VARCHAR`
+- `location VARCHAR`
+- `lot_images VARCHAR[]` (Arrow `List(Utf8)`)
+- `url VARCHAR`
+- `scraped_at TIMESTAMP`
 
-### Example
+### `lot_prices`
 
-```bash
-# run forever (default 60s interval)
-auctions-sync --adbc-uri grpc://localhost:50051
+Append-only snapshots
 
-# run once (useful for cron / smoke testing)
-auctions-sync --once
+- `auctioneer VARCHAR NOT NULL`
+- `auction_id VARCHAR NOT NULL`
+- `lot_id VARCHAR NOT NULL`
+- `bid DOUBLE`
+- `scraped_at TIMESTAMP NOT NULL`
 
-# only track specific auctions
-auctions-sync --aid 67956 --aid 67957 --interval-seconds 30
-```
+---
 
 ## ADBC options
 
-Optional in DB mode:
-
-- `--adbc-options '{"adbc.flight.sql.authorization_header":"mytoken"}'`
-- `--catalog foo`
-- `--schema auctions_data`
+- `--adbc-options '{"adbc.flight.sql.authorization_header":"<token>"}'`
+- `--catalog <name>`
+- `--schema <name>`
 
 Defaults when DB mode is enabled:
 
@@ -111,13 +118,7 @@ Defaults when DB mode is enabled:
 - Driver: `adbc_driver_flightsql`
 - Schema: `public`
 
-## Tables
-
-- `auctions` primary key: `(auction_id)`
-- `lots` primary key: `(auctioneer, auction_id, lot_id)`
-  - includes `description`, `location`, and `lot_images` as `List(Utf8)` / `VARCHAR[]`
-- `lot_prices`: append-only bid snapshots (no primary key; one row per scrape)
-  - `bid` is stored as numeric (`DOUBLE`) and currency symbols are stripped during scrape
+---
 
 ## Developer checks
 
