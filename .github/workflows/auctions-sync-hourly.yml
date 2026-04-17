@@ -33,6 +33,10 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Build auctions-sync binary
+        id: build-auctions-sync
+        uses: ./.github/actions/build-auctions-sync
+
       - name: Install Flight SQL ADBC driver via dbc
         uses: columnar-tech/setup-dbc@v1
         with:
@@ -66,7 +70,7 @@ jobs:
             EXTRA_ARGS+=(--max-auctions "${MAX_AUCTIONS}")
           fi
 
-          cargo run --bin auctions-sync -- --once --verbose \
+          "${{ steps.build-auctions-sync.outputs.binary-path }}" --once --verbose \
             --adbc-uri "${FLIGHT_ENDPOINT}" \
             --adbc-driver flightsql \
             --adbc-options "${ADBC_OPTIONS}" \

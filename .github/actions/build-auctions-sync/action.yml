@@ -1,0 +1,70 @@
+name: Build auctions-sync
+
+description: Build and cache the auctions-sync binary for fast workflow runs.
+
+inputs:
+  profile:
+    description: Cargo profile to build with
+    required: false
+    default: release
+  cache-key-prefix:
+    description: Prefix for the binary cache key
+    required: false
+    default: auctions-sync-bin
+
+outputs:
+  binary-path:
+    description: Absolute path to the built/cached auctions-sync binary
+    value: ${{ steps.output.outputs.binary-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute binary cache key
+      id: keygen
+      shell: bash
+      env:
+        CACHE_KEY_PREFIX: ${{ inputs.cache-key-prefix }}
+      run: |
+        set -euo pipefail
+
+        SOURCE_HASH=$(cat Cargo.toml Cargo.lock $(find src -type f | sort) | shasum -a 256 | awk '{print $1}')
+        RUSTC_VERSION=$(rustc -V | tr ' ' '-')
+        KEY="${CACHE_KEY_PREFIX}-${RUNNER_OS}-${RUSTC_VERSION}-${SOURCE_HASH}"
+
+        echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached auctions-sync binary
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.local/bin/auctions-sync
+        key: ${{ steps.keygen.outputs.key }}
+
+    - name: Build auctions-sync
+      if: ${{ steps.cache-restore.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        mkdir -p "$HOME/.local/bin"
+        cargo build --locked --profile ${{ inputs.profile }} --bin auctions-sync
+        install -m 755 target/${{ inputs.profile }}/auctions-sync "$HOME/.local/bin/auctions-sync"
+
+    - name: Save auctions-sync binary cache
+      if: ${{ steps.cache-restore.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.local/bin/auctions-sync
+        key: ${{ steps.keygen.outputs.key }}
+
+    - name: Verify auctions-sync binary
+      shell: bash
+      run: |
+        set -euo pipefail
+        "$HOME/.local/bin/auctions-sync" --version
+
+    - name: Set output
+      id: output
+      shell: bash
+      run: echo "binary-path=$HOME/.local/bin/auctions-sync" >> "$GITHUB_OUTPUT"
