@@ -1,0 +1,63 @@
+name: Auctions Sync (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auctions-sync-hourly
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLIGHT_ENDPOINT: ${{ vars.AUCTIONS_FLIGHT_ENDPOINT || 'grpc+tls://us-west-2-prod-aws-flight.spiceai.io:443' }}
+      HTTP_ENDPOINT: ${{ vars.AUCTIONS_HTTP_ENDPOINT || 'https://us-west-2-prod-aws-flight.spiceai.io' }}
+      CATALOG: ${{ vars.AUCTIONS_CATALOG || 'foo' }}
+      SCHEMA: ${{ vars.AUCTIONS_SCHEMA || 'public' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Flight SQL ADBC driver via dbc
+        uses: columnar-tech/setup-dbc@v1
+        with:
+          drivers: flightsql
+
+      - name: Run auctions-sync once
+        env:
+          SPICE_API_KEY: ${{ secrets.SPICE_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SPICE_API_KEY:-}" ]; then
+            echo "::error::Missing required repository secret: SPICE_API_KEY"
+            exit 1
+          fi
+
+          # Keep HTTP endpoint visible in logs for debugging/documentation parity.
+          echo "HTTP endpoint: ${HTTP_ENDPOINT}"
+          echo "Flight endpoint: ${FLIGHT_ENDPOINT}"
+          echo "Catalog/Schema: ${CATALOG}.${SCHEMA}"
+
+          ADBC_OPTIONS=$(printf '{"adbc.flight.sql.authorization_header":"%s"}' "$SPICE_API_KEY")
+
+          cargo run --bin auctions-sync -- --once \
+            --adbc-uri "${FLIGHT_ENDPOINT}" \
+            --adbc-driver flightsql \
+            --adbc-options "${ADBC_OPTIONS}" \
+            --catalog "${CATALOG}" \
+            --schema "${SCHEMA}"
