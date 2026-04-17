@@ -5,6 +5,7 @@ use auctions::{db, scraper};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
     let cli = Cli::parse();
@@ -15,16 +16,29 @@ fn main() {
         _ => LevelFilter::DEBUG,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .init();
+    init_tracing(level);
 
     if let Err(e) = run(cli) {
         eprintln!("{}: {e}", styled_error());
         std::process::exit(1);
     }
+}
+
+fn init_tracing(level: LevelFilter) {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive(
+            "html5ever::tree_builder=error"
+                .parse()
+                .expect("valid html5ever directive"),
+        );
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
 }
 
 fn styled_error() -> &'static str {

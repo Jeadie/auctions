@@ -15,12 +15,13 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       FLIGHT_ENDPOINT: ${{ vars.AUCTIONS_FLIGHT_ENDPOINT || 'grpc+tls://us-west-2-prod-aws-flight.spiceai.io:443' }}
       HTTP_ENDPOINT: ${{ vars.AUCTIONS_HTTP_ENDPOINT || 'https://us-west-2-prod-aws-flight.spiceai.io' }}
       CATALOG: ${{ vars.AUCTIONS_CATALOG || 'foo' }}
       SCHEMA: ${{ vars.AUCTIONS_SCHEMA || 'public' }}
+      MAX_AUCTIONS: ${{ vars.AUCTIONS_MAX_AUCTIONS || '' }}
 
     steps:
       - name: Checkout
@@ -52,12 +53,23 @@ jobs:
           echo "HTTP endpoint: ${HTTP_ENDPOINT}"
           echo "Flight endpoint: ${FLIGHT_ENDPOINT}"
           echo "Catalog/Schema: ${CATALOG}.${SCHEMA}"
+          if [ -n "${MAX_AUCTIONS}" ]; then
+            echo "Max auctions per run: ${MAX_AUCTIONS}"
+          else
+            echo "Max auctions per run: unlimited"
+          fi
 
           ADBC_OPTIONS=$(printf '{"adbc.flight.sql.authorization_header":"%s"}' "$SPICE_API_KEY")
 
-          cargo run --bin auctions-sync -- --once \
+          EXTRA_ARGS=()
+          if [ -n "${MAX_AUCTIONS}" ]; then
+            EXTRA_ARGS+=(--max-auctions "${MAX_AUCTIONS}")
+          fi
+
+          cargo run --bin auctions-sync -- --once --verbose \
             --adbc-uri "${FLIGHT_ENDPOINT}" \
             --adbc-driver flightsql \
             --adbc-options "${ADBC_OPTIONS}" \
             --catalog "${CATALOG}" \
-            --schema "${SCHEMA}"
+            --schema "${SCHEMA}" \
+            "${EXTRA_ARGS[@]}"

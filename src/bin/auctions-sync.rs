@@ -7,6 +7,7 @@ use auctions::error::Result;
 use auctions::scraper;
 use clap::{Args, Parser};
 use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -95,16 +96,29 @@ fn main() {
         _ => LevelFilter::DEBUG,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .init();
+    init_tracing(level);
 
     if let Err(e) = run(cli) {
         eprintln!("{}: {e}", styled_error());
         std::process::exit(1);
     }
+}
+
+fn init_tracing(level: LevelFilter) {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive(
+            "html5ever::tree_builder=error"
+                .parse()
+                .expect("valid html5ever directive"),
+        );
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
 }
 
 fn styled_error() -> &'static str {
@@ -143,13 +157,13 @@ fn run(cli: Cli) -> Result<()> {
     loop {
         let cycle_started = Instant::now();
         let cycle_result = run_cycle(&client, &mut database, &cli);
-        handle_cycle_result(cycle_result, cli.quiet, cli.once)?;
+        let elapsed = cycle_started.elapsed();
+        handle_cycle_result(cycle_result, cli.quiet, cli.once, elapsed)?;
 
         if cli.once {
             break;
         }
 
-        let elapsed = cycle_started.elapsed();
         if elapsed < interval {
             thread::sleep(interval - elapsed);
         }
@@ -158,13 +172,19 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn handle_cycle_result(cycle_result: Result<CycleStats>, quiet: bool, once: bool) -> Result<()> {
+fn handle_cycle_result(
+    cycle_result: Result<CycleStats>,
+    quiet: bool,
+    once: bool,
+    elapsed: Duration,
+) -> Result<()> {
     match cycle_result {
         Ok(stats) => {
             status(
                 quiet,
                 format!(
-                    "Cycle complete: {} auctions updated, {} auctions processed, {} skipped, {} lots seen, {} new lots appended, {} lot-price rows written",
+                    "Cycle complete in {:.1}s: {} auctions updated, {} auctions processed, {} skipped, {} lots seen, {} new lots appended, {} lot-price rows written",
+                    elapsed.as_secs_f64(),
                     stats.auctions_written,
                     stats.auctions_processed,
                     stats.auctions_skipped,
@@ -178,7 +198,10 @@ fn handle_cycle_result(cycle_result: Result<CycleStats>, quiet: bool, once: bool
             if once {
                 return Err(err);
             }
-            status(quiet, format!("Cycle failed: {err}"));
+            status(
+                quiet,
+                format!("Cycle failed after {:.1}s: {err}", elapsed.as_secs_f64()),
+            );
         }
     }
 
@@ -192,6 +215,7 @@ fn run_cycle(
 ) -> Result<CycleStats> {
     status(cli.quiet, "Fetching auction list …");
     let auctions = client.scrape_auctions()?;
+    let total_auctions = auctions.len();
 
     let aid_filter = auction_id_filter(&cli.aid);
     let mut selected = auctions
@@ -207,6 +231,15 @@ fn run_cycle(
         selected.truncate(limit);
     }
 
+    status(
+        cli.quiet,
+        format!(
+            "Fetched {} auctions; processing {} this cycle",
+            total_auctions,
+            selected.len()
+        ),
+    );
+
     let auctions_written = database.write_auctions(&selected)?;
 
     let mut stats = CycleStats {
@@ -214,7 +247,19 @@ fn run_cycle(
         ..CycleStats::default()
     };
 
-    for auction in selected {
+    let total_selected = selected.len();
+    for (index, auction) in selected.into_iter().enumerate() {
+        let ordinal = index + 1;
+        if ordinal == 1 || ordinal % 25 == 0 || ordinal == total_selected {
+            status(
+                cli.quiet,
+                format!(
+                    "Processing auction {}/{} (aid={})",
+                    ordinal, total_selected, auction.auction_id
+                ),
+            );
+        }
+
         let Some(auctioneer) = auction.auctioneer.filter(|value| !value.trim().is_empty()) else {
             stats.auctions_skipped += 1;
             tracing::warn!(auction_id = %auction.auction_id, "skipping lots scrape: auctioneer missing");
@@ -266,6 +311,7 @@ mod tests {
     use super::{Cli, CycleStats, auction_id_filter, handle_cycle_result};
     use auctions::error::Error;
     use clap::Parser;
+    use std::time::Duration;
 
     #[test]
     fn aid_filter_is_none_when_no_ids_are_provided() {
@@ -295,6 +341,7 @@ mod tests {
             }),
             true,
             true,
+            Duration::from_secs(1),
         )
         .expect_err("once mode should return cycle errors");
 
@@ -309,6 +356,7 @@ mod tests {
             }),
             true,
             false,
+            Duration::from_secs(1),
         )
         .expect("continuous mode should continue after cycle errors");
     }
@@ -324,7 +372,8 @@ mod tests {
             lot_price_rows: 10,
         };
 
-        handle_cycle_result(Ok(stats), true, true).expect("success should pass in once mode");
+        handle_cycle_result(Ok(stats), true, true, Duration::from_secs(1))
+            .expect("success should pass in once mode");
         handle_cycle_result(
             Ok(CycleStats {
                 auctions_written: 1,
@@ -332,6 +381,7 @@ mod tests {
             }),
             true,
             false,
+            Duration::from_secs(1),
         )
         .expect("success should pass in continuous mode");
     }
