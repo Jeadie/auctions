@@ -117,6 +117,7 @@ Defaults when DB mode is enabled:
 - `lots` primary key: `(auctioneer, auction_id, lot_id)`
   - includes `description`, `location`, and `lot_images` as `List(Utf8)` / `VARCHAR[]`
 - `lot_prices`: append-only bid snapshots (no primary key; one row per scrape)
+  - `bid` is stored as numeric (`DOUBLE`) and currency symbols are stripped during scrape
 
 ## Developer checks
 

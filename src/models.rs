@@ -21,7 +21,7 @@ pub struct Lot {
     pub auctioneer: Option<String>,
     pub lot_number: Option<String>,
     pub title: Option<String>,
-    pub current_bid: Option<String>,
+    pub current_bid: Option<f64>,
     pub time_remaining: Option<String>,
     pub seconds_remaining: Option<i64>,
     pub image_url: Option<String>,

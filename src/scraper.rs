@@ -255,6 +255,34 @@ fn clean_html_block(html: &str) -> String {
         .to_owned()
 }
 
+fn parse_bid_amount(raw: Option<&str>) -> Option<f64> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut token = String::new();
+    let mut started = false;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() || ch == ',' || ch == '.' {
+            token.push(ch);
+            started = true;
+            continue;
+        }
+
+        if started {
+            break;
+        }
+    }
+
+    if token.is_empty() {
+        return None;
+    }
+
+    token.replace(',', "").parse::<f64>().ok()
+}
+
 fn parse_auctions(doc: &Html) -> Result<Vec<Auction>> {
     let auction_item_sel = parse_selector_for_auctions(".auction_list_item")?;
     let details_sel = parse_selector_for_auctions("a[href*='AuctionDetails.aspx']")?;
@@ -357,7 +385,7 @@ fn parse_lots(doc: &Html, auction_id: &str) -> Result<ScrapedLots> {
 
         let title = opt_text(a.select(&lot_title_sel).next());
 
-        let current_bid = opt_text(a.select(&bid_sel).next());
+        let current_bid = parse_bid_amount(opt_text(a.select(&bid_sel).next()).as_deref());
 
         let time_span = a.select(&time_sel).next();
         let time_remaining = opt_text(time_span);
@@ -401,7 +429,7 @@ fn parse_lots(doc: &Html, auction_id: &str) -> Result<ScrapedLots> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_auctions, parse_lot_details, parse_lots, query_param};
+    use super::{parse_auctions, parse_bid_amount, parse_lot_details, parse_lots, query_param};
     use scraper::Html;
 
     #[test]
@@ -409,6 +437,13 @@ mod tests {
         let href = "AuctionDetails.aspx?smode=0&aid=67956#x";
         assert_eq!(query_param(href, "aid"), Some("67956"));
         assert_eq!(query_param(href, "missing"), None);
+    }
+
+    #[test]
+    fn parse_bid_amount_strips_currency_and_commas() {
+        assert_eq!(parse_bid_amount(Some("$1,250")), Some(1250.0));
+        assert_eq!(parse_bid_amount(Some("AUD 99.95 incl GST")), Some(99.95));
+        assert_eq!(parse_bid_amount(Some("No bids")), None);
     }
 
     #[test]
@@ -473,7 +508,7 @@ mod tests {
         assert_eq!(l.lot_id, "1234");
         assert_eq!(l.auction_id, "67956");
         assert_eq!(l.lot_number.as_deref(), Some("12"));
-        assert_eq!(l.current_bid.as_deref(), Some("$1,250"));
+        assert_eq!(l.current_bid, Some(1250.0));
         assert_eq!(l.seconds_remaining, Some(3600));
         assert_eq!(l.description, None);
         assert_eq!(l.location, None);
