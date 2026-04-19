@@ -7,10 +7,11 @@
 Writes into 3 tables:
 
 1. **`auctions`**: Auctions currently present
-2. **`lots`**: Per-lot detailed information, pricing and image locations.
-3. **`lot_prices`**: Bid pricing, per lot.
+2. **`lots`**: Per-lot metadata and media (`description`, `location`, `lot_images`, etc.)
+3. **`lot_prices`**: Bid snapshots per lot (written only when bid changes)
 
-`auctions-sync` is designed for repeated runs, or one off updates to the database.
+`auctions-sync` is designed for repeated runs. It keeps list-page scraping lightweight,
+only detail-scrapes lots that are new/incomplete, and avoids duplicate lot-price rows when bids are unchanged.
 
 ---
 

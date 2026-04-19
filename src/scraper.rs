@@ -55,8 +55,10 @@ impl LloydsClient {
         parse_auctions(&doc)
     }
 
-    /// Fetch and parse all lots for a given auction ID.
-    pub fn scrape_lots(&self, aid: u64, page_size: u32) -> Result<ScrapedLots> {
+    /// Fetch and parse all lots for a given auction ID without scraping per-lot detail pages.
+    ///
+    /// This is the lightweight path used by the sync loop for frequent polling.
+    pub fn scrape_lots_light(&self, aid: u64, page_size: u32) -> Result<ScrapedLots> {
         let aid_s = aid.to_string();
         let pgs_s = page_size.to_string();
         let doc = self.get_html(
@@ -64,30 +66,37 @@ impl LloydsClient {
             &[("smode", "0"), ("aid", &aid_s), ("pgs", &pgs_s)],
         )?;
 
-        let mut scraped = parse_lots(&doc, &aid_s)?;
+        parse_lots(&doc, &aid_s)
+    }
+
+    /// Fetch and parse all lots for a given auction ID, including detail-page enrichment.
+    pub fn scrape_lots(&self, aid: u64, page_size: u32) -> Result<ScrapedLots> {
+        let aid_s = aid.to_string();
+        let mut scraped = self.scrape_lots_light(aid, page_size)?;
 
         for lot in &mut scraped.lots {
-            match self.scrape_lot_details(&aid_s, &lot.lot_id) {
-                Ok(details) => {
-                    lot.description = details.description;
-                    lot.location = details.location;
-                    if lot.image_url.is_none() {
-                        lot.image_url = details.lot_images.first().cloned();
-                    }
-                    lot.lot_images = details.lot_images;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        auction_id = %aid_s,
-                        lot_id = %lot.lot_id,
-                        error = %error,
-                        "failed to scrape lot detail; keeping list-page fields"
-                    );
-                }
+            if let Err(error) = self.enrich_lot_with_details(&aid_s, lot) {
+                tracing::warn!(
+                    auction_id = %aid_s,
+                    lot_id = %lot.lot_id,
+                    error = %error,
+                    "failed to scrape lot detail; keeping list-page fields"
+                );
             }
         }
 
         Ok(scraped)
+    }
+
+    pub fn enrich_lot_with_details(&self, auction_id: &str, lot: &mut Lot) -> Result<()> {
+        let details = self.scrape_lot_details(auction_id, &lot.lot_id)?;
+        lot.description = details.description;
+        lot.location = details.location;
+        if lot.image_url.is_none() {
+            lot.image_url = details.lot_images.first().cloned();
+        }
+        lot.lot_images = details.lot_images;
+        Ok(())
     }
 
     fn scrape_lot_details(&self, auction_id: &str, lot_id: &str) -> Result<ScrapedLotDetails> {

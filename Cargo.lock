@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
+ "arrow-array",
  "assert_cmd",
  "chrono",
  "clap",

@@ -41,6 +41,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # ADBC
 adbc_core           = "0.22"
 adbc_driver_manager = "0.22"
+arrow-array         = "57"
 
 [dev-dependencies]
 assert_cmd = "2"

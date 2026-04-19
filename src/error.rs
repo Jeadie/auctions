@@ -26,6 +26,9 @@ pub enum Error {
     #[snafu(display("Database setup failed ({query}): {message}"))]
     DbSetup { query: String, message: String },
 
+    #[snafu(display("Database read failed ({query}): {message}"))]
+    DbRead { query: String, message: String },
+
     #[snafu(display("Failed to write {rows} rows to {table}: {message}"))]
     DbWrite {
         rows: usize,

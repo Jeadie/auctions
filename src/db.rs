@@ -5,6 +5,10 @@ use adbc_core::{
     options::{AdbcVersion, OptionDatabase, OptionValue},
 };
 use adbc_driver_manager::ManagedDriver;
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray,
+};
 use chrono::Utc;
 
 use crate::error::{Error, Result};
@@ -94,6 +98,12 @@ pub struct Db {
     config: DbConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LotDetailState {
+    pub has_description: bool,
+    pub has_images: bool,
+}
+
 impl Db {
     /// Open an ADBC connection. Bare tokens in `authorization_header` are
     /// automatically prefixed with `Bearer `.
@@ -161,6 +171,33 @@ impl Db {
             message,
         })?;
         Ok(())
+    }
+
+    fn execute_query_batches(&mut self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let mut stmt = self.conn.new_statement().map_err(|e| Error::DbRead {
+            query: truncate_sql(sql),
+            message: e.to_string(),
+        })?;
+        stmt.set_sql_query(sql).map_err(|e| Error::DbRead {
+            query: truncate_sql(sql),
+            message: e.to_string(),
+        })?;
+
+        let mut reader = stmt.execute().map_err(|e| Error::DbRead {
+            query: truncate_sql(sql),
+            message: e.to_string(),
+        })?;
+
+        let mut batches = Vec::new();
+        for batch in &mut reader {
+            let batch = batch.map_err(|e| Error::DbRead {
+                query: truncate_sql(sql),
+                message: e.to_string(),
+            })?;
+            batches.push(batch);
+        }
+
+        Ok(batches)
     }
 
     pub fn setup(&mut self) -> Result<()> {
@@ -323,6 +360,52 @@ impl Db {
         Ok(lots.len())
     }
 
+    /// Fetch persisted lot detail completeness for one auction.
+    pub fn lot_detail_state_for_auction(
+        &mut self,
+        auctioneer: &str,
+        auction_id: &str,
+    ) -> Result<HashMap<String, LotDetailState>> {
+        let table_ref = self.config.table_ref_quoted("lots");
+        let sql = format!(
+            "SELECT lot_id, description IS NOT NULL AS has_description, lot_images IS NOT NULL AS has_images \
+             FROM {table_ref} \
+             WHERE auctioneer = {} AND auction_id = {}",
+            lit(auctioneer),
+            lit(auction_id)
+        );
+
+        let mut state = HashMap::new();
+
+        for batch in self.execute_query_batches(&sql)? {
+            if batch.num_columns() < 3 {
+                continue;
+            }
+
+            for row in 0..batch.num_rows() {
+                let Some(lot_id) = string_cell(batch.column(0).as_ref(), row) else {
+                    continue;
+                };
+
+                let has_description = bool_cell(batch.column(1).as_ref(), row).unwrap_or(false);
+                let has_images = bool_cell(batch.column(2).as_ref(), row).unwrap_or(false);
+
+                state
+                    .entry(lot_id)
+                    .and_modify(|existing: &mut LotDetailState| {
+                        existing.has_description |= has_description;
+                        existing.has_images |= has_images;
+                    })
+                    .or_insert(LotDetailState {
+                        has_description,
+                        has_images,
+                    });
+            }
+        }
+
+        Ok(state)
+    }
+
     /// Append lots without deleting existing rows.
     ///
     /// On runtimes that enforce the `(auctioneer, auction_id, lot_id)` primary key,
@@ -371,7 +454,7 @@ impl Db {
         Ok(inserted)
     }
 
-    /// Append a price snapshot for every lot in this scrape pass.
+    /// Append a new lot price snapshot only when the bid differs from the last recorded value.
     pub fn append_lot_prices(&mut self, lots: &[Lot]) -> Result<usize> {
         if lots.is_empty() {
             return Ok(0);
@@ -382,35 +465,127 @@ impl Db {
         let cols = "auctioneer, auction_id, lot_id, bid, scraped_at";
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        for chunk in lots.chunks(BATCH_SIZE) {
-            let values = chunk
-                .iter()
-                .map(|lot| {
-                    let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
-
-                    Ok(format!(
-                        "({}, {}, {}, {}, '{now}')",
-                        lit(auctioneer),
-                        lit(&lot.auction_id),
-                        lit(&lot.lot_id),
-                        lit_opt_f64(lot.current_bid),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            self.execute_update(&format!(
-                "INSERT INTO {table_ref} ({cols}) VALUES {}",
-                values.join(", ")
-            ))
-            .map_err(|message| Error::DbWrite {
-                rows: chunk.len(),
-                table: table_label.clone(),
-                message,
-            })?;
+        let mut grouped: HashMap<(String, String), Vec<&Lot>> = HashMap::new();
+        for lot in lots {
+            let auctioneer = ensure_lot_has_auctioneer(lot, &table_label)?;
+            grouped
+                .entry((auctioneer.to_owned(), lot.auction_id.clone()))
+                .or_default()
+                .push(lot);
         }
 
-        tracing::info!(rows = lots.len(), table = %table_label, "wrote lot price snapshots");
-        Ok(lots.len())
+        let mut written = 0usize;
+
+        for ((auctioneer, auction_id), group_lots) in grouped {
+            let previous =
+                self.latest_lot_bid_by_lot_id(&table_ref, &auctioneer, &auction_id, &group_lots)?;
+            let changed = group_lots
+                .into_iter()
+                .filter(|lot| {
+                    let prior = previous.get(&lot.lot_id).copied().flatten();
+                    bid_changed(lot.current_bid, prior)
+                })
+                .collect::<Vec<_>>();
+
+            for chunk in changed.chunks(BATCH_SIZE) {
+                let values = chunk
+                    .iter()
+                    .map(|lot| {
+                        format!(
+                            "({}, {}, {}, {}, '{now}')",
+                            lit(&auctioneer),
+                            lit(&lot.auction_id),
+                            lit(&lot.lot_id),
+                            lit_opt_f64(lot.current_bid),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                self.execute_update(&format!(
+                    "INSERT INTO {table_ref} ({cols}) VALUES {}",
+                    values.join(", ")
+                ))
+                .map_err(|message| Error::DbWrite {
+                    rows: chunk.len(),
+                    table: table_label.clone(),
+                    message,
+                })?;
+
+                written += chunk.len();
+            }
+        }
+
+        tracing::info!(
+            attempted = lots.len(),
+            written,
+            table = %table_label,
+            "wrote changed lot price snapshots"
+        );
+
+        Ok(written)
+    }
+
+    fn latest_lot_bid_by_lot_id(
+        &mut self,
+        table_ref: &str,
+        auctioneer: &str,
+        auction_id: &str,
+        lots: &[&Lot],
+    ) -> Result<HashMap<String, Option<f64>>> {
+        let lot_ids = lots
+            .iter()
+            .map(|lot| lot.lot_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        if lot_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut latest = HashMap::new();
+
+        for chunk in lot_ids.chunks(BATCH_SIZE) {
+            let quoted_ids = chunk
+                .iter()
+                .map(|id| lit(id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT p.lot_id, p.bid \
+                 FROM {table_ref} p \
+                 JOIN ( \
+                     SELECT lot_id, MAX(scraped_at) AS scraped_at \
+                     FROM {table_ref} \
+                     WHERE auctioneer = {} AND auction_id = {} AND lot_id IN ({quoted_ids}) \
+                     GROUP BY lot_id \
+                 ) latest \
+                 ON p.lot_id = latest.lot_id AND p.scraped_at = latest.scraped_at \
+                 WHERE p.auctioneer = {} AND p.auction_id = {}",
+                lit(auctioneer),
+                lit(auction_id),
+                lit(auctioneer),
+                lit(auction_id)
+            );
+
+            for batch in self.execute_query_batches(&sql)? {
+                if batch.num_columns() < 2 {
+                    continue;
+                }
+
+                for row in 0..batch.num_rows() {
+                    let Some(lot_id) = string_cell(batch.column(0).as_ref(), row) else {
+                        continue;
+                    };
+
+                    latest
+                        .entry(lot_id)
+                        .or_insert_with(|| f64_cell(batch.column(1).as_ref(), row));
+                }
+            }
+        }
+
+        Ok(latest)
     }
 }
 
@@ -540,12 +715,76 @@ fn truncate_sql(sql: &str) -> String {
     }
 }
 
+fn string_cell(array: &dyn Array, row: usize) -> Option<String> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(values.value(row).to_owned());
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some(values.value(row).to_owned());
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(values.value(row).to_owned());
+    }
+
+    None
+}
+
+fn bool_cell(array: &dyn Array, row: usize) -> Option<bool> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Some(values.value(row));
+    }
+
+    string_cell(array, row).and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "1" => Some(true),
+        "false" | "f" | "0" => Some(false),
+        _ => None,
+    })
+}
+
+fn f64_cell(array: &dyn Array, row: usize) -> Option<f64> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Some(values.value(row));
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        return Some(values.value(row) as f64);
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return Some(values.value(row) as f64);
+    }
+
+    string_cell(array, row).and_then(|value| value.parse::<f64>().ok())
+}
+
+fn bid_changed(current: Option<f64>, previous: Option<f64>) -> bool {
+    match (current, previous) {
+        (None, None) => false,
+        (Some(current), Some(previous)) => (current - previous).abs() > f64::EPSILON,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DbConfig, delete_auction_keys_sql, delete_lot_keys_sql, ensure_lot_has_auctioneer,
-        format_lot_values, lit, lit_bool, lit_opt, lit_opt_array_of_strings, lit_opt_f64,
-        quote_ident,
+        DbConfig, bid_changed, delete_auction_keys_sql, delete_lot_keys_sql,
+        ensure_lot_has_auctioneer, format_lot_values, lit, lit_bool, lit_opt,
+        lit_opt_array_of_strings, lit_opt_f64, quote_ident,
     };
     use crate::error::Error;
     use crate::models::{Auction, Lot};
@@ -755,5 +994,14 @@ mod tests {
         );
         assert!(sql_values.contains("'Near-new with extras'"));
         assert!(sql_values.contains("'Melbourne, VIC'"));
+    }
+
+    #[test]
+    fn bid_changed_detects_meaningful_differences() {
+        assert!(!bid_changed(None, None));
+        assert!(bid_changed(Some(100.0), None));
+        assert!(bid_changed(None, Some(100.0)));
+        assert!(!bid_changed(Some(100.0), Some(100.0)));
+        assert!(bid_changed(Some(100.0), Some(100.5)));
     }
 }

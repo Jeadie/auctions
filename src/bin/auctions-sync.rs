@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use auctions::db;
 use auctions::error::Result;
+use auctions::models::Lot;
 use auctions::scraper;
 use clap::{Args, Parser};
 use tracing::level_filters::LevelFilter;
@@ -275,7 +276,7 @@ fn run_cycle(
             }
         };
 
-        let scraped = match client.scrape_lots(aid, cli.page_size) {
+        let scraped = match client.scrape_lots_light(aid, cli.page_size) {
             Ok(scraped) => scraped,
             Err(err) => {
                 stats.auctions_skipped += 1;
@@ -289,8 +290,68 @@ fn run_cycle(
             lot.auctioneer = Some(auctioneer.clone());
         }
 
+        let existing_detail_state =
+            database.lot_detail_state_for_auction(&auctioneer, &auction.auction_id)?;
+
+        let mut new_lots = Vec::new();
+        let mut refreshed_lots = Vec::new();
+        let mut detail_scrape_attempts = 0usize;
+
+        for lot in &mut lots {
+            let existing = existing_detail_state.get(&lot.lot_id);
+            let is_new_lot = existing.is_none();
+            let should_scrape = lot_needs_detail_scrape(existing);
+            let mut detail_scrape_ok = false;
+
+            if should_scrape {
+                detail_scrape_attempts += 1;
+                match client.enrich_lot_with_details(&auction.auction_id, lot) {
+                    Ok(()) => detail_scrape_ok = true,
+                    Err(error) => {
+                        tracing::warn!(
+                            auction_id = %auction.auction_id,
+                            lot_id = %lot.lot_id,
+                            error = %error,
+                            "failed to scrape lot detail; keeping list-page fields"
+                        );
+                    }
+                }
+            }
+
+            if is_new_lot {
+                new_lots.push(lot.clone());
+            } else if should_scrape
+                && detail_scrape_ok
+                && let Some(existing) = existing
+            {
+                if can_refresh_existing_lot(existing, lot) {
+                    refreshed_lots.push(lot.clone());
+                } else {
+                    tracing::debug!(
+                        auction_id = %auction.auction_id,
+                        lot_id = %lot.lot_id,
+                        "skipping lot refresh to avoid overwriting existing detail fields"
+                    );
+                }
+            }
+        }
+
         stats.lots_seen += lots.len();
-        stats.lots_appended += database.append_new_lots(&lots)?;
+        stats.lots_appended += database.append_new_lots(&new_lots)?;
+        if !refreshed_lots.is_empty() {
+            let refreshed = database.write_lots(&refreshed_lots)?;
+            tracing::info!(auction_id = %auction.auction_id, rows = refreshed, "refreshed lots missing detail fields");
+        }
+
+        tracing::debug!(
+            auction_id = %auction.auction_id,
+            total_lots = lots.len(),
+            new_lots = new_lots.len(),
+            detail_scrape_attempts,
+            detail_refreshes = refreshed_lots.len(),
+            "auction lot processing summary"
+        );
+
         stats.lot_price_rows += database.append_lot_prices(&lots)?;
         stats.auctions_processed += 1;
     }
@@ -306,12 +367,54 @@ fn auction_id_filter(aid: &[u64]) -> Option<HashSet<String>> {
     }
 }
 
+fn lot_needs_detail_scrape(state: Option<&db::LotDetailState>) -> bool {
+    match state {
+        None => true,
+        Some(state) => !state.has_description || !state.has_images,
+    }
+}
+
+fn can_refresh_existing_lot(existing: &db::LotDetailState, scraped: &Lot) -> bool {
+    if existing.has_description && scraped.description.is_none() {
+        return false;
+    }
+
+    if existing.has_images && scraped.lot_images.is_empty() {
+        return false;
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CycleStats, auction_id_filter, handle_cycle_result};
+    use super::{
+        Cli, CycleStats, auction_id_filter, can_refresh_existing_lot, handle_cycle_result,
+        lot_needs_detail_scrape,
+    };
+    use auctions::db::LotDetailState;
     use auctions::error::Error;
+    use auctions::models::Lot;
     use clap::Parser;
     use std::time::Duration;
+
+    fn sample_lot() -> Lot {
+        Lot {
+            lot_id: "1".to_owned(),
+            auction_id: "A".to_owned(),
+            auctioneer: Some("Lloyds".to_owned()),
+            lot_number: None,
+            title: None,
+            current_bid: Some(100.0),
+            time_remaining: None,
+            seconds_remaining: None,
+            image_url: None,
+            description: Some("desc".to_owned()),
+            location: None,
+            lot_images: vec!["https://example.com/a.jpg".to_owned()],
+            url: "https://example.com/lot/1".to_owned(),
+        }
+    }
 
     #[test]
     fn aid_filter_is_none_when_no_ids_are_provided() {
@@ -359,6 +462,40 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("continuous mode should continue after cycle errors");
+    }
+
+    #[test]
+    fn lot_detail_scrape_policy_targets_new_or_incomplete_rows() {
+        assert!(lot_needs_detail_scrape(None));
+        assert!(lot_needs_detail_scrape(Some(&LotDetailState {
+            has_description: false,
+            has_images: true,
+        })));
+        assert!(lot_needs_detail_scrape(Some(&LotDetailState {
+            has_description: true,
+            has_images: false,
+        })));
+        assert!(!lot_needs_detail_scrape(Some(&LotDetailState {
+            has_description: true,
+            has_images: true,
+        })));
+    }
+
+    #[test]
+    fn refresh_guard_prevents_overwriting_existing_detail_fields_with_nulls() {
+        let existing = LotDetailState {
+            has_description: true,
+            has_images: true,
+        };
+
+        let mut scraped = sample_lot();
+        scraped.description = None;
+        scraped.lot_images.clear();
+        assert!(!can_refresh_existing_lot(&existing, &scraped));
+
+        scraped.description = Some("desc".to_owned());
+        scraped.lot_images = vec!["https://example.com/a.jpg".to_owned()];
+        assert!(can_refresh_existing_lot(&existing, &scraped));
     }
 
     #[test]
