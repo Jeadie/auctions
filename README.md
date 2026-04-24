@@ -2,6 +2,29 @@
 
 `auctions` ingests auction data from [lloydsonline.com.au](https://www.lloydsonline.com.au) and writes it into any ADBC compatible database.
 
+## Website (GitHub Pages)
+
+A simple ecommerce-style auction web UI is included in:
+
+- `site/index.html`
+
+Supporting files:
+
+- `site/assets/styles.css`
+- `site/assets/main.js`
+- `site/config.js`
+- `.github/workflows/deploy-site-pages.yml`
+
+The site queries Spice Cloud directly from the browser using `spice.js` against `foo.public`.
+No `site/data/*.json` snapshot files are used.
+
+To preview locally:
+
+```bash
+python3 -m http.server 8080
+# then open http://localhost:8080/site/
+```
+
 ## Database
 
 Writes into 3 tables:

@@ -1,0 +1,55 @@
+name: Deploy site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    env:
+      AUCTIONS_SITE_HTTP_URL: ${{ vars.AUCTIONS_SITE_HTTP_URL || 'https://data.spiceai.io' }}
+      AUCTIONS_SITE_FLIGHT_URL: ${{ vars.AUCTIONS_SITE_FLIGHT_URL || 'flight.spiceai.io:443' }}
+      AUCTIONS_SITE_PUBLIC_API_KEY: ${{ vars.AUCTIONS_SITE_PUBLIC_API_KEY || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate site runtime config
+        run: |
+          cat > site/config.js <<EOF
+          window.AUCTIONS_SITE_CONFIG = {
+            httpUrl: "${AUCTIONS_SITE_HTTP_URL}",
+            flightUrl: "${AUCTIONS_SITE_FLIGHT_URL}",
+            apiKey: "${AUCTIONS_SITE_PUBLIC_API_KEY}",
+          };
+          EOF
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

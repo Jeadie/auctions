@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lloyds Auctions Marketplace</title>
+    <meta name="description" content="Browse and bid on lots from live Lloyds auctions." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container nav-wrap">
+        <a class="brand" href="javascript:void(0)" id="brand-link">
+          <span class="brand-mark">L</span>
+          Lloyds Auctions
+        </a>
+        <nav class="main-nav" aria-label="Primary">
+          <a href="javascript:void(0)" id="nav-lots">Lots</a>
+          <a href="javascript:void(0)" id="nav-auctions">Auctions</a>
+        </nav>
+      </div>
+    </header>
+
+    <!-- Main view -->
+    <div id="view-main">
+      <section class="section" id="lots-section">
+        <div class="container">
+          <div class="section-head">
+            <h2>Lots from live auctions</h2>
+            <div class="controls">
+              <input id="lot-search" type="search" placeholder="Search" aria-label="Search lots" />
+              <select id="lot-sort" aria-label="Sort lots">
+                <option value="bid-desc">Highest bid</option>
+                <option value="bid-asc">Lowest bid</option>
+                <option value="title-asc">Title A–Z</option>
+              </select>
+            </div>
+          </div>
+          <p id="lots-count" class="count-line"></p>
+          <div id="lots-grid" class="lots-grid">
+            <p class="loading">Loading lots…</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section section-alt" id="auctions-section">
+        <div class="container">
+          <div class="section-head">
+            <h2>Live auctions</h2>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table" aria-label="Live auctions">
+              <thead>
+                <tr>
+                  <th>Auction</th>
+                  <th>State</th>
+                  <th class="num">Lots</th>
+                </tr>
+              </thead>
+              <tbody id="auctions-body">
+                <tr><td colspan="3" class="loading">Loading auctions…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Auction detail view -->
+    <div id="view-auction" hidden>
+      <div class="container">
+        <div class="detail-head">
+          <a id="auction-back-link" href="javascript:void(0)" class="back-link">← All auctions</a>
+          <h2 id="auction-detail-title"></h2>
+          <p id="auction-detail-state" class="detail-sub"></p>
+        </div>
+        <div class="section-head">
+          <p id="auction-lots-count" class="count-line"></p>
+          <input id="auction-search" type="search" placeholder="Search" aria-label="Search this auction" />
+        </div>
+        <div id="auction-lots-grid" class="lots-grid">
+          <p class="loading">Loading lots…</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Lot detail view -->
+    <div id="view-lot" hidden>
+      <div class="container">
+        <a id="lot-back-link" href="javascript:void(0)" class="back-link">← Back</a>
+        <div id="lot-detail-content">
+          <p class="loading">Loading lot…</p>
+        </div>
+      </div>
+    </div>
+
+    <script src="./config.js"></script>
+    <script src="./assets/main.js" type="module"></script>
+  </body>
+</html>
