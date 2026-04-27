@@ -10,6 +10,8 @@ catalogs:
   - from: cayenne
     name: foo
     access: read_write_create
+    params:
+      cayenne_file_path: /data/foo/
 
 views:
   - name: live_lot_prices
