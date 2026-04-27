@@ -10,3 +10,35 @@ catalogs:
   - from: cayenne
     name: foo
     access: read_write_create
+
+views:
+  - name: live_lot_prices
+    acceleration: 
+      enabled: true
+      refresh_check_interval: 15s
+      refresh_mode: full
+    sql: |  
+      SELECT DISTINCT ON (l.auctioneer, l.auction_id, l.lot_id)
+        l.auctioneer,
+        l.auction_id,
+        a.title AS auction_title,
+        l.lot_id,
+        l.title AS lot_title,
+        l.image_url,
+        l.location,
+        l.url AS lot_url,
+        p.bid AS latest_bid,
+        p.scraped_at AS last_updated
+      FROM foo.public.lots l
+      JOIN foo.public.auctions a
+        ON a.auction_id = l.auction_id
+      AND a.is_live = TRUE
+      LEFT JOIN foo.public.lot_prices p
+        ON p.auctioneer = l.auctioneer
+      AND p.auction_id = l.auction_id
+      AND p.lot_id = l.lot_id
+      ORDER BY
+        l.auctioneer,
+        l.auction_id,
+        l.lot_id,
+        p.scraped_at DESC;
