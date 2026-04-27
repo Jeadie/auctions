@@ -11,7 +11,7 @@ catalogs:
     name: foo
     access: read_write_create
     params:
-      cayenne_file_path: /data/foo/
+      cayenne_data_dir: /data/foo/
       cayenne_metadata_dir: /data/foo/metadata/
 
 # views:
