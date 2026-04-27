@@ -12,6 +12,7 @@ catalogs:
     access: read_write_create
     params:
       cayenne_file_path: /data/foo/
+      cayenne_metadata_dir: /data/foo/metadata/
 
 # views:
 #   - name: live_lot_prices
