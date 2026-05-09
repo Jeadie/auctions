@@ -26,7 +26,7 @@ jobs:
     env:
       AUCTIONS_SITE_HTTP_URL: ${{ vars.AUCTIONS_SITE_HTTP_URL || 'https://data.spiceai.io' }}
       AUCTIONS_SITE_FLIGHT_URL: ${{ vars.AUCTIONS_SITE_FLIGHT_URL || 'flight.spiceai.io:443' }}
-      AUCTIONS_SITE_PUBLIC_API_KEY: ${{ vars.AUCTIONS_SITE_PUBLIC_API_KEY || '' }}
+      AUCTIONS_SITE_PUBLIC_API_KEY: ${{ secrets.AUCTIONS_SITE_PUBLIC_API_KEY || vars.AUCTIONS_SITE_PUBLIC_API_KEY || '' }}
 
     steps:
       - name: Checkout
