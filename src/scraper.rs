@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::thread;
+use std::time::Duration;
 
 use scraper::{ElementRef, Html, Selector};
 use snafu::ensure;
@@ -8,7 +10,16 @@ use crate::models::{Auction, Lot, ScrapedLots};
 
 const BASE_URL: &str = "https://www.lloydsonline.com.au";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const ACCEPT_HTML: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+const ACCEPT_LANGUAGE: &str = "en-AU,en;q=0.9,en-US;q=0.8";
+
+/// Polite delay between consecutive lot-detail page requests.
+const DETAIL_REQUEST_DELAY: Duration = Duration::from_millis(150);
+
+/// Wait this long before each retry attempt after a 403, re-warming the session in between.
+const DETAIL_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(3), Duration::from_secs(8)];
 
 pub struct LloydsClient {
     client: reqwest::blocking::Client,
@@ -25,6 +36,7 @@ impl LloydsClient {
         let client = reqwest::blocking::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
+            .cookie_store(true)
             .build()
             .map_err(|e| Error::Http {
                 url: BASE_URL.to_owned(),
@@ -34,11 +46,28 @@ impl LloydsClient {
     }
 
     fn get_html(&self, path: &str, params: &[(&str, &str)]) -> Result<Html> {
+        self.get_html_with_referer(path, params, None)
+    }
+
+    fn get_html_with_referer(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        referer: Option<&str>,
+    ) -> Result<Html> {
         let url = format!("{BASE_URL}/{path}");
-        let text = self
+        let mut request = self
             .client
             .get(&url)
             .query(params)
+            .header("Accept", ACCEPT_HTML)
+            .header("Accept-Language", ACCEPT_LANGUAGE);
+
+        if let Some(r) = referer {
+            request = request.header("Referer", r);
+        }
+
+        let text = request
             .send()
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.text())
@@ -89,6 +118,7 @@ impl LloydsClient {
     }
 
     pub fn enrich_lot_with_details(&self, auction_id: &str, lot: &mut Lot) -> Result<()> {
+        thread::sleep(DETAIL_REQUEST_DELAY);
         let details = self.scrape_lot_details(auction_id, &lot.lot_id)?;
         lot.description = details.description;
         lot.location = details.location;
@@ -99,13 +129,79 @@ impl LloydsClient {
         Ok(())
     }
 
+    /// Fetch a lot detail page, retrying on 403 after refreshing the session.
+    ///
+    /// A 403 from LotDetails.aspx most often means the session cookie set by
+    /// AuctionLots.aspx has expired or was never received.  The retry strategy
+    /// re-fetches the lots page (re-establishing cookies) and waits before
+    /// repeating the detail request.
     fn scrape_lot_details(&self, auction_id: &str, lot_id: &str) -> Result<ScrapedLotDetails> {
-        let doc = self.get_html(
-            "LotDetails.aspx",
-            &[("smode", "0"), ("aid", auction_id), ("lid", lot_id)],
-        )?;
-        parse_lot_details(&doc, auction_id, lot_id)
+        let referer = format!("{BASE_URL}/AuctionLots.aspx?smode=0&aid={auction_id}");
+        let params = [("smode", "0"), ("aid", auction_id), ("lid", lot_id)];
+        let max_attempts = 1 + DETAIL_RETRY_DELAYS.len();
+
+        let mut last_err = None;
+
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let delay = DETAIL_RETRY_DELAYS[attempt - 1];
+
+                tracing::debug!(
+                    auction_id,
+                    lot_id,
+                    attempt,
+                    delay_secs = delay.as_secs(),
+                    "refreshing session before lot-detail retry"
+                );
+
+                // Re-warm: a fresh lots-page request resets the session cookie.
+                let _ = self.get_html(
+                    "AuctionLots.aspx",
+                    &[("smode", "0"), ("aid", auction_id), ("pgs", "1")],
+                );
+
+                thread::sleep(delay);
+            }
+
+            match self.get_html_with_referer("LotDetails.aspx", &params, Some(&referer)) {
+                Ok(doc) => return parse_lot_details(&doc, auction_id, lot_id),
+
+                Err(e) if is_http_403(&e) => {
+                    let remaining = max_attempts - attempt - 1;
+                    if remaining > 0 {
+                        tracing::warn!(
+                            auction_id,
+                            lot_id,
+                            attempt,
+                            remaining_retries = remaining,
+                            "403 on lot detail page; will retry after session refresh"
+                        );
+                        last_err = Some(e);
+                    } else {
+                        tracing::warn!(
+                            auction_id,
+                            lot_id,
+                            "403 on lot detail page after {} attempts; giving up",
+                            max_attempts
+                        );
+                        return Err(e);
+                    }
+                }
+
+                // Non-403 errors are not retried.
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.expect("loop always populates last_err before breaking"))
     }
+}
+
+fn is_http_403(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Http { source, .. } if source.status().is_some_and(|s| s == 403)
+    )
 }
 
 fn parse_selector_for_auctions(css: &str) -> Result<Selector> {

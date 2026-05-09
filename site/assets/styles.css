@@ -210,10 +210,23 @@ body {
   font-size: 0.92rem;
   font-weight: 600;
   line-height: 1.35;
-  min-height: 2.4em;
   color: var(--text);
   text-decoration: none;
-  display: block;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.lot-desc {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .lot-location {
@@ -519,7 +532,6 @@ body {
   #auction-search { width: 100%; }
 
   .data-table thead th:nth-child(2),
-  .data-table tbody td:nth-child(2) { display: none; }
 }
 
 @media (max-width: 480px) {

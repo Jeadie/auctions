@@ -1,0 +1,69 @@
+kind: Spicepod
+version: v1
+name: auctions-read
+
+runtime:
+  caching:
+    sql_results:
+      enabled: true
+      max_size: 256MiB
+      item_ttl: 30s
+      cache_key_type: plan
+      encoding: zstd
+
+datasets:
+  - from: spice.ai/jeadie/auctions/datasets/foo.public.auctions
+    name: auctions
+    params:
+      spiceai_api_key: ${secrets:AUCTIONS_READ_API_KEY}
+
+  - from: spice.ai/jeadie/auctions/datasets/foo.public.lots
+    name: lots
+    params:
+      spiceai_api_key: ${secrets:AUCTIONS_READ_API_KEY}
+
+  - from: spice.ai/jeadie/auctions/datasets/foo.public.lot_prices
+    name: lot_prices
+    params:
+      spiceai_api_key: ${secrets:AUCTIONS_READ_API_KEY}
+
+views:
+  - name: live_lot_prices
+    acceleration:
+      enabled: true
+      refresh_check_interval: 30s
+      refresh_mode: full
+    columns:
+      - name: lot_title
+        full_text_search:
+          enabled: true
+          row_id:
+            - lot_id
+            - auction_id
+    sql: |
+      SELECT DISTINCT ON (l.auctioneer, l.auction_id, l.lot_id)
+        l.auctioneer,
+        l.auction_id,
+        a.title AS auction_title,
+        l.lot_id,
+        l.title AS lot_title,
+        l.image_url,
+        l.location,
+        l.url AS lot_url,
+        l.description as description,
+        l.lot_images as lot_images,
+        p.bid AS latest_bid,
+        p.scraped_at AS last_updated
+      FROM lots l
+      JOIN auctions a
+        ON a.auction_id = l.auction_id
+      AND a.is_live = TRUE
+      LEFT JOIN lot_prices p
+        ON p.auctioneer = l.auctioneer
+      AND p.auction_id = l.auction_id
+      AND p.lot_id = l.lot_id
+      ORDER BY
+        l.auctioneer,
+        l.auction_id,
+        l.lot_id,
+        p.scraped_at DESC;

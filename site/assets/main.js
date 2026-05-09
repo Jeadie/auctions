@@ -117,7 +117,10 @@ async function loadLots(search, sort) {
   count.textContent = "";
 
   try {
-    const rows = await queryRows(buildLotsSQL(search, sort));
+    const rows = search.trim()
+      ? await searchLots(search.trim(), sort)
+      : await queryRows(buildLotsSQL("", sort));
+
     count.textContent = `${rows.length} lots`;
     grid.innerHTML = rows.length
       ? rows.map((r) => lotCardHTML(r, true)).join("")
@@ -128,45 +131,63 @@ async function loadLots(search, sort) {
   }
 }
 
-function buildLotsSQL(search, sort) {
-  const s = search ? escapeLike(search.trim().toLowerCase()) : "";
-  const where = s
-    ? `WHERE (LOWER(l.title) LIKE '%${s}%' OR LOWER(COALESCE(l.location, '')) LIKE '%${s}%' OR LOWER(a.title) LIKE '%${s}%')`
-    : "";
-  const order =
-    sort === "bid-asc" ? "ORDER BY COALESCE(MAX(last_bid.bid), 0) ASC" :
-    sort === "title-asc" ? "ORDER BY MAX(l.title) ASC" :
-    "ORDER BY COALESCE(MAX(last_bid.bid), 0) DESC";
+async function searchLots(text, sort) {
+  const url = `${CONFIG.httpUrl}/v1/search`;
 
-  return `SELECT
-  l.auction_id,
-  MAX(a.title) AS auction_title,
-  l.lot_id,
-  MAX(l.title) AS lot_title,
-  MAX(l.image_url) AS image_url,
-  MAX(l.location) AS location,
-  MAX(l.url) AS lot_url,
-  MAX(last_bid.bid) AS latest_bid
-FROM "foo"."public"."lots" l
-INNER JOIN "foo"."public"."auctions" a ON a.auction_id = l.auction_id AND a.is_live = TRUE
-LEFT JOIN (
-  SELECT p.auctioneer, p.auction_id, p.lot_id, p.bid
-  FROM "foo"."public"."lot_prices" p
-  JOIN (
-    SELECT auctioneer, auction_id, lot_id, MAX(scraped_at) AS scraped_at
-    FROM "foo"."public"."lot_prices"
-    GROUP BY auctioneer, auction_id, lot_id
-  ) latest
-  ON p.auctioneer = latest.auctioneer
-  AND p.auction_id = latest.auction_id
-  AND p.lot_id = latest.lot_id
-  AND p.scraped_at = latest.scraped_at
-) last_bid
-ON last_bid.auctioneer = l.auctioneer
-AND last_bid.auction_id = l.auction_id
-AND last_bid.lot_id = l.lot_id
-${where}
-GROUP BY l.auction_id, l.lot_id
+  const body = {
+    text,
+    datasets: ["live_lot_prices"],
+    limit: 50,
+    additional_columns: [
+      "auction_id", "auction_title", "lot_id", "lot_title",
+      "image_url", "location", "lot_url", "latest_bid",
+    ],
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(CONFIG.apiKey ? { "X-API-Key": CONFIG.apiKey } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) throw new Error(`Search failed: ${resp.status}`);
+
+  const json = await resp.json();
+
+  // Map search results back to the same shape as SQL lot rows
+  const rows = (json.results || []).map((r) => {
+    const d = { ...r.data, ...r.primary_key };
+    return {
+      auction_id:    d.auction_id,
+      auction_title: d.auction_title,
+      lot_id:        d.lot_id,
+      lot_title:     d.lot_title,
+      image_url:     d.image_url,
+      location:      d.location,
+      lot_url:       d.lot_url,
+      latest_bid:    d.latest_bid,
+    };
+  });
+
+  // Search returns by relevance; re-sort if user picked a non-default order
+  if (sort === "bid-asc")   rows.sort((a, b) => bidVal(a) - bidVal(b));
+  if (sort === "title-asc") rows.sort((a, b) => String(a.lot_title || "").localeCompare(String(b.lot_title || "")));
+  // bid-desc: leave as-is (search already surfaces most relevant)
+
+  return rows;
+}
+
+function buildLotsSQL(search, sort) {
+  const order =
+    sort === "bid-asc"   ? "ORDER BY COALESCE(latest_bid, 0) ASC" :
+    sort === "title-asc" ? "ORDER BY lot_title ASC" :
+                           "ORDER BY COALESCE(latest_bid, 0) DESC";
+
+  return `SELECT auction_id, auction_title, lot_id, lot_title, image_url, location, lot_url, latest_bid
+FROM live_lot_prices
 ${order}
 LIMIT 50`;
 }
@@ -175,14 +196,9 @@ LIMIT 50`;
 
 async function loadAuctions() {
   try {
-    const rows = await queryRows(`SELECT
-    l.auction_id,
-    MAX(a.title) AS auction_title,
-    MAX(a.state) AS state,
-    COUNT(*) AS lot_count
-FROM "foo"."public"."lots" l
-INNER JOIN "foo"."public"."auctions" a ON a.auction_id = l.auction_id AND a.is_live = TRUE
-GROUP BY l.auction_id
+    const rows = await queryRows(`SELECT auction_id, MAX(auction_title) AS auction_title, COUNT(*) AS lot_count
+FROM live_lot_prices
+GROUP BY auction_id
 ORDER BY lot_count DESC`);
 
     state.auctions = rows;
@@ -190,7 +206,7 @@ ORDER BY lot_count DESC`);
   } catch (err) {
     console.error(err);
     document.getElementById("auctions-body").innerHTML =
-      `<tr><td colspan="3" class="empty">Could not load auctions.</td></tr>`;
+      `<tr><td colspan="2" class="empty">Could not load auctions.</td></tr>`;
   }
 }
 
@@ -200,7 +216,7 @@ async function loadAuctionDetail(auctionId) {
   const meta = state.auctions.find((a) => String(a.auction_id) === String(auctionId));
   document.getElementById("auction-detail-title").textContent =
     meta?.auction_title || `Auction ${auctionId}`;
-  document.getElementById("auction-detail-state").textContent = meta?.state || "";
+  document.getElementById("auction-detail-state").textContent = "";
   document.getElementById("auction-search").value = "";
   document.getElementById("auction-lots-count").textContent = "";
 
@@ -214,37 +230,10 @@ async function loadAuctionDetail(auctionId) {
 
   try {
     const safe = String(auctionId).replace(/\D/g, "");
-    const rows = await queryRows(`SELECT
-  l.auction_id,
-  MAX(a.title) AS auction_title,
-  l.lot_id,
-  MAX(l.title) AS lot_title,
-  MAX(l.image_url) AS image_url,
-  MAX(l.location) AS location,
-  MAX(l.url) AS lot_url,
-  MAX(last_bid.bid) AS latest_bid
-FROM "foo"."public"."lots" l
-LEFT JOIN "foo"."public"."auctions" a ON a.auction_id = l.auction_id
-LEFT JOIN (
-  SELECT p.auctioneer, p.auction_id, p.lot_id, p.bid
-  FROM "foo"."public"."lot_prices" p
-  JOIN (
-    SELECT auctioneer, auction_id, lot_id, MAX(scraped_at) AS scraped_at
-    FROM "foo"."public"."lot_prices"
-    GROUP BY auctioneer, auction_id, lot_id
-  ) latest
-  ON p.auctioneer = latest.auctioneer
-  AND p.auction_id = latest.auction_id
-  AND p.lot_id = latest.lot_id
-  AND p.scraped_at = latest.scraped_at
-) last_bid
-ON last_bid.auctioneer = l.auctioneer
-AND last_bid.auction_id = l.auction_id
-AND last_bid.lot_id = l.lot_id
-WHERE l.auction_id = '${safe}'
-GROUP BY l.auction_id, l.lot_id
-ORDER BY COALESCE(MAX(last_bid.bid), 0) DESC
-LIMIT 1000`);
+    const rows = await queryRows(`SELECT auction_id, auction_title, lot_id, lot_title, image_url, location, lot_url, latest_bid, description
+FROM live_lot_prices
+WHERE auction_id = '${safe}'
+ORDER BY COALESCE(latest_bid, 0) DESC`);
 
     state.auctionDetailCache[auctionId] = rows;
     state.currentAuctionLots = rows;
@@ -266,16 +255,12 @@ async function loadLotDetail(auctionId, lotId) {
     const safeLid = String(lotId).replace(/\D/g, "");
 
     const [lotRows, bidRows] = await Promise.all([
-      queryRows(`SELECT
-  l.lot_id, l.auction_id, l.lot_number, l.title, l.image_url,
-  l.description, l.location, l.lot_images, l.url,
-  a.title AS auction_title, a.date AS auction_date, a.state AS auction_state
-FROM "foo"."public"."lots" l
-LEFT JOIN "foo"."public"."auctions" a ON a.auction_id = l.auction_id
-WHERE l.lot_id = '${safeLid}' AND l.auction_id = '${safeAid}'
+      queryRows(`SELECT auction_id, auction_title, lot_id, lot_title, image_url, location, lot_url, latest_bid, description, lot_images
+FROM live_lot_prices
+WHERE lot_id = '${safeLid}' AND auction_id = '${safeAid}'
 LIMIT 1`),
       queryRows(`SELECT bid, CAST(scraped_at AS VARCHAR) AS scraped_at
-FROM "foo"."public"."lot_prices"
+FROM lot_prices
 WHERE lot_id = '${safeLid}' AND auction_id = '${safeAid}'
 ORDER BY scraped_at DESC
 LIMIT 20`),
@@ -313,7 +298,6 @@ function renderAuctions(rows) {
             <span class="row-arrow">→</span>
           </span>
         </td>
-        <td>${escapeHtml(row.state || "—")}</td>
         <td class="num">${Number(row.lot_count || 0).toLocaleString()}</td>
       </tr>
     `)
@@ -343,15 +327,15 @@ function renderAuctionLots(search) {
 function renderLotDetail(lot, bids) {
   const images = parseLotImages(lot.lot_images, lot.image_url);
   const primary = images[0] || lot.image_url || "";
-  const extras = images.slice(1);
-  const latestBid = bids.length > 0 && bids[0].bid != null ? bids[0].bid : null;
+  const latestBid = lot.latest_bid != null ? lot.latest_bid
+    : bids.length > 0 && bids[0].bid != null ? bids[0].bid : null;
 
   const content = document.getElementById("lot-detail-content");
   content.innerHTML = `
     <div class="lot-detail-layout">
       <div class="lot-detail-images">
         ${primary
-          ? `<img id="lot-main-img" class="lot-main-image" src="${escapeHtml(primary)}" alt="${escapeHtml(lot.title || "")}" />`
+          ? `<img id="lot-main-img" class="lot-main-image" src="${escapeHtml(primary)}" alt="${escapeHtml(lot.lot_title || "")}" />`
           : `<div class="lot-main-image"></div>`
         }
         ${images.length > 1 ? `
@@ -371,8 +355,7 @@ function renderLotDetail(lot, bids) {
           ← ${escapeHtml(lot.auction_title || `Auction ${lot.auction_id}`)}
         </a>
 
-        ${lot.lot_number ? `<p class="lot-detail-number">Lot ${escapeHtml(lot.lot_number)}</p>` : ""}
-        <h2 class="lot-detail-title">${escapeHtml(lot.title || `Lot ${lot.lot_id}`)}</h2>
+        <h2 class="lot-detail-title">${escapeHtml(lot.lot_title || `Lot ${lot.lot_id}`)}</h2>
         ${lot.location ? `<p class="lot-detail-location">${escapeHtml(lot.location)}</p>` : ""}
 
         <div class="bid-box">
@@ -383,8 +366,8 @@ function renderLotDetail(lot, bids) {
           }</p>
         </div>
 
-        ${lot.url ? `
-          <a class="lot-cta" href="${escapeHtml(lot.url)}" target="_blank" rel="noreferrer">
+        ${lot.lot_url ? `
+          <a class="lot-cta" href="${escapeHtml(lot.lot_url)}" target="_blank" rel="noreferrer">
             Bid on Lloyds Auctions →
           </a>
         ` : ""}
@@ -435,6 +418,7 @@ function lotCardHTML(row, showAuction) {
   const bid = row.latest_bid == null
     ? "No bids yet"
     : `$${Number(row.latest_bid).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  const desc = row.description ? escapeHtml(stripHtml(row.description).slice(0, 120)).trimEnd() + "…" : "";
 
   return `
     <article class="lot-card" onclick="location.hash='${escapeHtml(href)}'">
@@ -445,6 +429,7 @@ function lotCardHTML(row, showAuction) {
       <div class="lot-body">
         ${showAuction && auctionTitle ? `<p class="lot-auction">${auctionTitle}</p>` : ""}
         <span class="lot-title">${title}</span>
+        ${desc ? `<p class="lot-desc">${desc}</p>` : ""}
         ${location ? `<p class="lot-location">${location}</p>` : ""}
         <div class="lot-footer">
           <p class="lot-bid">${bid}</p>
@@ -498,13 +483,6 @@ function parseLotImages(val, fallback) {
   return imgs;
 }
 
-function escapeLike(str) {
-  return str
-    .replace(/\\/g, "\\\\")
-    .replace(/%/g, "\\%")
-    .replace(/_/g, "\\_")
-    .replace(/'/g, "''");
-}
 
 function formatTimestamp(value) {
   const d = new Date(value);
@@ -518,6 +496,13 @@ function sanitizeDescription(html) {
     .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
     .replace(/\son\w+="[^"]*"/gi, "")
     .replace(/\son\w+='[^']*'/gi, "");
+}
+
+function stripHtml(html) {
+  return String(html)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function escapeHtml(value) {
