@@ -20,6 +20,10 @@ const DEFAULT_ADBC_URI: &str = "grpc://localhost:50051";
 const DEFAULT_SCHEMA: &str = "public";
 const BATCH_SIZE: usize = 200;
 
+/// Smaller batch size for lot rows, which include description (potentially multi-KB plain text)
+/// and a lot_images array. Keeps individual INSERT statements well under server memory limits.
+const LOT_BATCH_SIZE: usize = 20;
+
 pub struct DbConfig {
     pub driver: String,
     pub uri: String,
@@ -322,7 +326,7 @@ impl Db {
         let cols = "lot_id, auction_id, auctioneer, lot_number, title, image_url, description, location, lot_images, url, scraped_at";
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        for chunk in lots.chunks(BATCH_SIZE) {
+        for chunk in lots.chunks(LOT_BATCH_SIZE) {
             let validated = chunk
                 .iter()
                 .map(|lot| {
@@ -422,7 +426,7 @@ impl Db {
 
         let mut inserted = 0usize;
 
-        for chunk in lots.chunks(BATCH_SIZE) {
+        for chunk in lots.chunks(LOT_BATCH_SIZE) {
             let values = chunk
                 .iter()
                 .map(|lot| {

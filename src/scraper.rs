@@ -21,6 +21,10 @@ const DETAIL_REQUEST_DELAY: Duration = Duration::from_millis(150);
 /// Wait this long before each retry attempt after a 403, re-warming the session in between.
 const DETAIL_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(3), Duration::from_secs(8)];
 
+/// Maximum number of lot images stored per lot. Galleries can have 80+ images; cap at a
+/// number useful for display while dramatically reducing INSERT payload size.
+const MAX_LOT_IMAGES: usize = 20;
+
 pub struct LloydsClient {
     client: reqwest::blocking::Client,
 }
@@ -257,7 +261,7 @@ fn parse_lot_details(doc: &Html, auction_id: &str, lot_id: &str) -> Result<Scrap
     let description = doc
         .select(&description_sel)
         .next()
-        .map(|el| clean_html_block(&el.inner_html()))
+        .map(|el| inner_text(el))
         .filter(|text| !text.is_empty());
 
     let location = extract_location(doc, &strong_sel)
@@ -329,6 +333,10 @@ fn extract_lot_images(doc: &Html, carousel_img_sel: &Selector) -> Vec<String> {
     let mut seen = HashSet::new();
 
     for img in doc.select(carousel_img_sel) {
+        if images.len() >= MAX_LOT_IMAGES {
+            break;
+        }
+
         for attr in ["data-src", "src"] {
             let Some(raw) = img.value().attr(attr) else {
                 continue;
@@ -346,18 +354,6 @@ fn extract_lot_images(doc: &Html, carousel_img_sel: &Selector) -> Vec<String> {
     }
 
     images
-}
-
-fn clean_html_block(html: &str) -> String {
-    html.replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("\r", "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_owned()
 }
 
 fn parse_bid_amount(raw: Option<&str>) -> Option<f64> {
