@@ -2,10 +2,6 @@ kind: Spicepod
 version: v1
 name: auctions
 
-runtime:
-  flight:
-    do_put_rate_limit_enabled: false
-
 catalogs:
   - from: cayenne
     name: foo
